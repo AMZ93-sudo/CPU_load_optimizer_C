@@ -6,13 +6,19 @@ Analyzes .c and .h files for CPU load optimization opportunities using
 25+ verified, industry-standard rules. No LLM dependency.
 
 Usage:
-    python cpu_load_optimizer.py <file_or_directory> [options]
+    python cpu_load_optimizer.py                        → Launch GUI
+    python cpu_load_optimizer.py --gui                  → Launch GUI
+    python cpu_load_optimizer.py <file_or_dir> [opts]   → Analyze file(s)
+    python cpu_load_optimizer.py --staged <repo> [opts] → Analyze staged changes
 
 Options:
-    --output, -o    Output HTML report path (default: cpu_load_report.html)
-    --severity, -s  Minimum severity: critical|high|medium|low (default: low)
-    --annotate      Enable code screenshot annotations (requires Pillow)
-    --verbose, -v   Print findings to console
+    --output, -o     Output HTML report path (default: Output/)
+    --severity, -s   Minimum severity: critical|high|medium|low
+    --annotate       Enable code screenshot annotations (requires Pillow)
+    --llm-export     Generate LLM validation export for Gemini/GPT review
+    --staged REPO    Analyze only staged git changes in REPO
+    --gui            Launch graphical interface
+    --verbose, -v    Print findings to console
 
 Author: KSS Platform Team
 References:
@@ -30,9 +36,10 @@ import re
 import sys
 import html
 import json
+import subprocess
 from dataclasses import dataclass, field, asdict
 from enum import IntEnum
-from typing import List, Dict, Tuple, Optional, Callable
+from typing import List, Dict, Tuple, Optional, Callable, Set
 from pathlib import Path
 from datetime import datetime
 from collections import Counter, defaultdict
@@ -982,15 +989,41 @@ class RulesEngine:
     def _validate_not_float_context(self, match, line: str,
                                      lines: List[str],
                                      line_idx: int) -> bool:
-        """Reject if the operation is on float/double variables."""
-        # Check surrounding lines for float/double declaration of the variable
+        """Reject if the operation is on float/double variables.
+
+        Checks for DIRECT float/double declaration of the variable,
+        not just any float keyword appearing near the variable name.
+        This avoids false positives like:
+          float my_func(int raw_adc)  ← raw_adc is int, not float
+        """
         var_name = match.group(1)
         start = max(0, line_idx - 20)
         context = '\n'.join(lines[start:line_idx + 1])
-        float_decl = re.search(
-            rf'\b(?:float|double)\s+.*\b{re.escape(var_name)}\b', context
+
+        # Pattern 1: Direct variable declaration
+        #   float var_name   /  double var_name  /  float *var_name
+        direct_decl = re.search(
+            rf'\b(?:float|double)\s+\*?\s*{re.escape(var_name)}\b',
+            context
         )
-        return float_decl is None
+        if direct_decl:
+            return False  # Variable IS float → skip this rule
+
+        # Pattern 2: Variable assigned from float cast or float literal
+        #   var_name = (float)...  /  var_name = 3.14
+        float_assign = re.search(
+            rf'\b{re.escape(var_name)}\s*=\s*\((?:float|double)\)',
+            context
+        )
+        if float_assign:
+            return False
+
+        # Pattern 3: Check if current line has float result
+        #   float result = var_name / 8  (result is float, so op is float)
+        if re.match(r'\s*(?:float|double)\s+', line):
+            return False
+
+        return True  # Variable is NOT float → rule applies
 
     def _validate_not_standard_func(self, match, line: str,
                                      lines: List[str],
@@ -2577,7 +2610,170 @@ ANALYZING your code instead of parsing HTML tags.
 
 
 # ============================================================================
-# MAIN CLI
+# GIT STAGED CHANGES ANALYZER
+# ============================================================================
+
+class GitAnalyzer:
+    """
+    Handles git repository analysis — specifically staged changes.
+
+    Uses git CLI via subprocess (no gitpython dependency).
+    Parses unified diff to identify exactly which lines changed,
+    then filters analysis findings to only report issues on those lines.
+    """
+
+    @staticmethod
+    def is_git_repo(path: str) -> bool:
+        """Check if the given path is inside a git repository."""
+        try:
+            result = subprocess.run(
+                ['git', '-C', path, 'rev-parse', '--is-inside-work-tree'],
+                capture_output=True, text=True, timeout=5
+            )
+            return result.returncode == 0 and result.stdout.strip() == 'true'
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return False
+
+    @staticmethod
+    def get_repo_root(path: str) -> Optional[str]:
+        """Get the root directory of the git repository."""
+        try:
+            result = subprocess.run(
+                ['git', '-C', path, 'rev-parse', '--show-toplevel'],
+                capture_output=True, text=True, timeout=5
+            )
+            if result.returncode == 0:
+                return result.stdout.strip()
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
+        return None
+
+    @staticmethod
+    def get_staged_files(repo_path: str) -> List[str]:
+        """
+        Get list of staged .c/.h files (added or modified).
+
+        Returns absolute paths to the staged files.
+        """
+        try:
+            result = subprocess.run(
+                ['git', '-C', repo_path, 'diff', '--cached',
+                 '--name-only', '--diff-filter=ACM'],
+                capture_output=True, text=True, timeout=10
+            )
+            if result.returncode != 0:
+                return []
+
+            all_files = result.stdout.strip().split('\n')
+            c_h_files = [
+                f for f in all_files
+                if f.strip() and (f.endswith('.c') or f.endswith('.h'))
+            ]
+            # Convert to absolute paths
+            return [
+                os.path.join(repo_path, f) for f in c_h_files
+            ]
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return []
+
+    @staticmethod
+    def get_staged_line_numbers(repo_path: str,
+                                 file_path: str) -> set:
+        """
+        Parse 'git diff --cached' to extract the exact line numbers
+        that were added or modified in the staged version.
+
+        Returns a set of 1-based line numbers representing changed lines.
+
+        How it works:
+        - Unified diff headers look like: @@ -old,count +new,count @@
+        - Lines starting with '+' (but not '+++') are additions
+        - We track the current line number in the new (staged) version
+        - Only '+' lines are "changed" — context lines are unchanged
+        """
+        rel_path = os.path.relpath(file_path, repo_path)
+        try:
+            result = subprocess.run(
+                ['git', '-C', repo_path, 'diff', '--cached', '-U0',
+                 '--', rel_path],
+                capture_output=True, text=True, timeout=10
+            )
+            if result.returncode != 0:
+                return set()
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return set()
+
+        changed_lines = set()
+        current_line = 0
+
+        for line in result.stdout.split('\n'):
+            # Parse hunk header: @@ -old_start,old_count +new_start,new_count @@
+            hunk_match = re.match(
+                r'^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@', line
+            )
+            if hunk_match:
+                start = int(hunk_match.group(1))
+                count = int(hunk_match.group(2)) if hunk_match.group(2) else 1
+                # With -U0, all lines in the range are changes
+                for i in range(count):
+                    changed_lines.add(start + i)
+                continue
+
+        return changed_lines
+
+    @staticmethod
+    def get_staged_content(repo_path: str, file_path: str) -> Optional[str]:
+        """
+        Get the staged version of a file (not the working copy).
+
+        This is important: the working copy might have unstaged changes.
+        We want to analyze exactly what will be committed.
+        """
+        rel_path = os.path.relpath(file_path, repo_path)
+        try:
+            result = subprocess.run(
+                ['git', '-C', repo_path, 'show', f':{rel_path}'],
+                capture_output=True, text=True, timeout=10
+            )
+            if result.returncode == 0:
+                return result.stdout
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
+        return None
+
+    @staticmethod
+    def get_staged_summary(repo_path: str,
+                            staged_files: List[str]) -> Dict:
+        """
+        Build a summary of staged changes for display.
+
+        Returns dict with file names, line counts, etc.
+        """
+        summary = {
+            'repo_root': repo_path,
+            'total_files': len(staged_files),
+            'files': []
+        }
+
+        for fp in staged_files:
+            changed_lines = GitAnalyzer.get_staged_line_numbers(
+                repo_path, fp
+            )
+            summary['files'].append({
+                'path': fp,
+                'name': os.path.basename(fp),
+                'changed_lines': len(changed_lines),
+                'line_numbers': sorted(changed_lines)
+            })
+
+        summary['total_changed_lines'] = sum(
+            f['changed_lines'] for f in summary['files']
+        )
+        return summary
+
+
+# ============================================================================
+# CORE ANALYSIS RUNNER (shared by CLI and GUI)
 # ============================================================================
 
 def discover_files(target: str) -> List[str]:
@@ -2599,106 +2795,120 @@ def discover_files(target: str) -> List[str]:
         return []
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="CPU Load Optimizer — Static analysis for embedded C "
-                    "CPU load optimization",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python cpu_load_optimizer.py src/sensor.c
-  python cpu_load_optimizer.py ./platform/ -o report.html -s high
-  python cpu_load_optimizer.py . --annotate --verbose
+def run_analysis(files: List[str],
+                 output_path: str,
+                 min_severity: str = "low",
+                 annotate: bool = False,
+                 llm_export: bool = False,
+                 verbose: bool = False,
+                 staged_mode: bool = False,
+                 repo_path: Optional[str] = None,
+                 staged_lines: Optional[Dict[str, set]] = None,
+                 log_callback=None) -> Dict:
+    """
+    Core analysis pipeline — used by both CLI and GUI.
 
-Rules Reference:
-  25+ verified optimization rules based on MISRA C:2012,
-  ARM Architecture Manual, Renesas AppNotes, and GCC documentation.
-  No LLM dependency — fully deterministic, offline analysis.
-        """
-    )
-    parser.add_argument("target", help="Path to .c/.h file or directory")
-    parser.add_argument("-o", "--output", default=None,
-                        help="Output HTML report path (default: Output/cpu_load_report.html)")
-    parser.add_argument("-s", "--severity", default="low",
-                        choices=["critical", "high", "medium", "low"],
-                        help="Minimum severity to report")
-    parser.add_argument("--annotate", action="store_true",
-                        help="Enable code screenshot annotations (needs Pillow)")
-    parser.add_argument("--llm-export", action="store_true",
-                        help="Generate LLM-optimized validation export for Gemini/GPT review")
-    parser.add_argument("-v", "--verbose", action="store_true",
-                        help="Print findings to console")
+    Args:
+        files: List of file paths to analyze
+        output_path: Where to write the HTML report
+        min_severity: Minimum severity to report
+        annotate: Whether to generate code annotations
+        llm_export: Whether to generate LLM validation export
+        verbose: Print findings to console
+        staged_mode: If True, filter findings to staged lines only
+        repo_path: Git repo root (required if staged_mode=True)
+        staged_lines: Dict of {filepath: set(line_numbers)} for filtering
+        log_callback: Optional function(msg) for GUI logging
 
-    args = parser.parse_args()
+    Returns:
+        Dict with analysis results summary
+    """
+    def log(msg):
+        if log_callback:
+            log_callback(msg)
+        print(msg)
 
-    # ── Resolve output path: default to Output/ folder next to script ──
-    if args.output is None:
-        script_dir = Path(os.path.dirname(os.path.abspath(__file__)))
-        output_dir = script_dir / "Output"
-        output_dir.mkdir(parents=True, exist_ok=True)
-        args.output = str(output_dir / "cpu_load_report.html")
-        print(f"  Output directory: {output_dir}")
-    else:
-        # If user specified a path, ensure its parent directory exists
-        output_path = Path(args.output)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
+    # Ensure output directory exists
+    output_dir = Path(output_path).parent
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Discover files
-    files = discover_files(args.target)
-    if not files:
-        print("No .c or .h files found.")
-        sys.exit(1)
-
-    print(f"\n{'='*60}")
-    print(f"  CPU Load Optimizer v1.0")
-    print(f"  Analyzing {len(files)} file(s)...")
-    print(f"{'='*60}\n")
-
-    # Initialize engine
     engine = RulesEngine()
-    min_sev = Severity.from_str(args.severity)
+    min_sev = Severity.from_str(min_severity)
     all_findings = []
+    analysis_mode = "Staged Changes" if staged_mode else "Full File"
 
-    # Analyze each file
+    log(f"\n{'='*60}")
+    log(f"  CPU Load Optimizer v1.0")
+    log(f"  Mode: {analysis_mode}")
+    log(f"  Analyzing {len(files)} file(s)...")
+    log(f"{'='*60}\n")
+
     for fp in files:
-        print(f"  Scanning: {fp}")
+        log(f"  Scanning: {os.path.basename(fp)}")
         try:
-            with open(fp, 'r', encoding='utf-8', errors='replace') as f:
-                source = f.read()
-            findings = engine.analyze(source, fp, min_sev)
-            all_findings.extend(findings)
-            print(f"    → {len(findings)} finding(s)")
-        except Exception as e:
-            print(f"    → Error: {e}")
+            if staged_mode and repo_path:
+                # Read the STAGED version, not the working copy
+                source = GitAnalyzer.get_staged_content(repo_path, fp)
+                if source is None:
+                    log(f"    → Error: cannot read staged content")
+                    continue
+            else:
+                with open(fp, 'r', encoding='utf-8', errors='replace') as f:
+                    source = f.read()
 
-    # Sort all findings
+            findings = engine.analyze(source, fp, min_sev)
+
+            # Filter to staged lines only if in staged mode
+            if staged_mode and staged_lines and fp in staged_lines:
+                changed = staged_lines[fp]
+                before_count = len(findings)
+                findings = [
+                    f for f in findings if f.line_number in changed
+                ]
+                log(f"    → {before_count} total findings, "
+                    f"{len(findings)} on staged lines")
+            else:
+                log(f"    → {len(findings)} finding(s)")
+
+            all_findings.extend(findings)
+
+        except Exception as e:
+            log(f"    → Error: {e}")
+
+    # Sort findings
     all_findings.sort(key=lambda f: (-f.severity, -f.impact_score))
 
     # Print to console if verbose
-    if args.verbose:
-        print(f"\n{'─'*60}")
+    if verbose:
+        log(f"\n{'─'*60}")
         for f in all_findings:
-            print(f"  [{f.severity_name:8}] {f.rule_id} {f.rule_name}")
-            print(f"           {os.path.basename(f.file_path)}:{f.line_number}")
-            print(f"           Impact: {f.impact_score}/100")
-            print(f"           {f.matched_text[:80]}")
-            print()
+            log(f"  [{f.severity_name:8}] {f.rule_id} {f.rule_name}")
+            log(f"           {os.path.basename(f.file_path)}:{f.line_number}")
+            log(f"           Impact: {f.impact_score}/100")
+            log(f"           {f.matched_text[:80]}")
+            log("")
 
-    # Generate report
-    annotator = CodeAnnotator() if args.annotate else None
+    # Generate HTML report
+    annotator = CodeAnnotator() if annotate else None
     report_path = ReportGenerator.generate(
-        all_findings, files, annotator, args.output
+        all_findings, files, annotator, output_path
     )
 
-    # Generate LLM validation export if requested
+    # Generate LLM export if requested
     llm_export_paths = None
-    if args.llm_export:
-        llm_output_dir = str(Path(args.output).parent / "llm_validation")
+    if llm_export:
+        llm_output_dir = str(Path(output_path).parent / "llm_validation")
         source_contents = {}
         for fp in files:
             try:
-                with open(fp, 'r', encoding='utf-8', errors='replace') as f:
-                    source_contents[fp] = f.read()
+                if staged_mode and repo_path:
+                    content = GitAnalyzer.get_staged_content(repo_path, fp)
+                    if content:
+                        source_contents[fp] = content
+                else:
+                    with open(fp, 'r', encoding='utf-8',
+                              errors='replace') as f:
+                        source_contents[fp] = f.read()
             except Exception:
                 pass
 
@@ -2706,15 +2916,865 @@ Rules Reference:
             all_findings, files, llm_output_dir, source_contents
         )
 
-    print(f"\n{'='*60}")
-    print(f"  Analysis Complete!")
-    print(f"  Total findings: {len(all_findings)}")
-    print(f"  Report saved to: {report_path}")
+    log(f"\n{'='*60}")
+    log(f"  Analysis Complete! ({analysis_mode})")
+    log(f"  Total findings: {len(all_findings)}")
+    log(f"  Report saved to: {report_path}")
     if llm_export_paths:
-        print(f"  LLM validation export saved to:")
+        log(f"  LLM validation export:")
         for p in llm_export_paths:
-            print(f"    → {p}")
-    print(f"{'='*60}\n")
+            log(f"    → {p}")
+    log(f"{'='*60}\n")
+
+    return {
+        'total_findings': len(all_findings),
+        'findings': all_findings,
+        'report_path': report_path,
+        'llm_export_paths': llm_export_paths,
+        'by_severity': dict(Counter(f.severity_name for f in all_findings)),
+        'mode': analysis_mode,
+    }
+
+
+# ============================================================================
+# GUI — tkinter Launcher
+# ============================================================================
+
+def launch_gui():
+    """Launch the tkinter GUI for CPU Load Optimizer."""
+    try:
+        import tkinter as tk
+        from tkinter import ttk, filedialog, messagebox
+    except ImportError:
+        print("Error: tkinter is not available.")
+        print("Install with: sudo apt-get install python3-tk")
+        sys.exit(1)
+
+    class OptimizerGUI:
+        """
+        Professional GUI launcher with two analysis modes.
+
+        Mode 1: Analyze specific source file(s) or directory
+        Mode 2: Analyze only staged git changes in a repository
+        """
+
+        # ── Color scheme (matches HTML report theme) ──
+        BG = "#0f0f17"
+        SURFACE = "#1a1a2e"
+        SURFACE2 = "#222240"
+        BORDER = "#2d2d4a"
+        TEXT = "#e2e2f0"
+        TEXT_DIM = "#8888a8"
+        ACCENT = "#6c5ce7"
+        ACCENT_LIGHT = "#a78bfa"
+        CRITICAL = "#dc2626"
+        HIGH = "#ea580c"
+        MEDIUM = "#ca8a04"
+        LOW = "#2563eb"
+        SUCCESS = "#16a34a"
+
+        def __init__(self):
+            self.root = tk.Tk()
+            self.root.title("CPU Load Optimizer v1.0")
+            self.root.configure(bg=self.BG)
+            self.root.resizable(True, True)
+
+            # Center window
+            w, h = 720, 740
+            x = (self.root.winfo_screenwidth() // 2) - (w // 2)
+            y = (self.root.winfo_screenheight() // 2) - (h // 2)
+            self.root.geometry(f"{w}x{h}+{x}+{y}")
+            self.root.minsize(600, 650)
+
+            # Variables
+            self.mode = tk.StringVar(value="file")
+            self.file_path = tk.StringVar()
+            self.repo_path = tk.StringVar()
+            self.severity = tk.StringVar(value="low")
+            self.llm_export = tk.BooleanVar(value=True)
+            self.annotate = tk.BooleanVar(value=False)
+            self.is_running = False
+
+            self._build_ui()
+
+        def _build_ui(self):
+            """Construct the full GUI layout."""
+            root = self.root
+
+            # ── Header ───────────────────────────────────────
+            header = tk.Frame(root, bg=self.SURFACE, pady=16, padx=24)
+            header.pack(fill=tk.X)
+
+            tk.Label(
+                header, text="CPU Load Optimizer",
+                font=("Segoe UI", 22, "bold"),
+                fg=self.ACCENT_LIGHT, bg=self.SURFACE
+            ).pack(anchor=tk.W)
+            tk.Label(
+                header,
+                text="Static analysis for embedded C/H CPU optimization "
+                     "• 25+ verified rules • No LLM dependency",
+                font=("Segoe UI", 9),
+                fg=self.TEXT_DIM, bg=self.SURFACE
+            ).pack(anchor=tk.W, pady=(4, 0))
+
+            # ── Separator ────────────────────────────────────
+            tk.Frame(root, bg=self.BORDER, height=1).pack(fill=tk.X)
+
+            # ── Main content frame ───────────────────────────
+            content = tk.Frame(root, bg=self.BG, padx=24, pady=16)
+            content.pack(fill=tk.BOTH, expand=True)
+
+            # ── Mode Selection ───────────────────────────────
+            mode_label = tk.Label(
+                content, text="ANALYSIS MODE",
+                font=("Segoe UI", 10, "bold"),
+                fg=self.ACCENT_LIGHT, bg=self.BG
+            )
+            mode_label.pack(anchor=tk.W, pady=(0, 10))
+
+            # --- Mode 1: File Analysis ---
+            mode1_frame = tk.Frame(content, bg=self.SURFACE,
+                                   highlightbackground=self.BORDER,
+                                   highlightthickness=1, padx=16, pady=12)
+            mode1_frame.pack(fill=tk.X, pady=(0, 8))
+
+            mode1_top = tk.Frame(mode1_frame, bg=self.SURFACE)
+            mode1_top.pack(fill=tk.X)
+
+            self.rb_file = tk.Radiobutton(
+                mode1_top, text="Analyze Source File / Directory",
+                variable=self.mode, value="file",
+                font=("Segoe UI", 11, "bold"),
+                fg=self.TEXT, bg=self.SURFACE,
+                selectcolor=self.SURFACE2,
+                activebackground=self.SURFACE,
+                activeforeground=self.ACCENT_LIGHT,
+                command=self._on_mode_change
+            )
+            self.rb_file.pack(side=tk.LEFT)
+
+            tk.Label(
+                mode1_frame,
+                text="Browse for a .c / .h file or a folder "
+                     "containing source files",
+                font=("Segoe UI", 9),
+                fg=self.TEXT_DIM, bg=self.SURFACE
+            ).pack(anchor=tk.W, pady=(2, 8))
+
+            file_row = tk.Frame(mode1_frame, bg=self.SURFACE)
+            file_row.pack(fill=tk.X)
+
+            self.file_entry = tk.Entry(
+                file_row, textvariable=self.file_path,
+                font=("Consolas", 10),
+                bg=self.SURFACE2, fg=self.TEXT,
+                insertbackground=self.TEXT,
+                relief=tk.FLAT, highlightthickness=1,
+                highlightbackground=self.BORDER
+            )
+            self.file_entry.pack(side=tk.LEFT, fill=tk.X, expand=True,
+                                 ipady=6, padx=(0, 8))
+
+            self.btn_browse_file = tk.Button(
+                file_row, text="Browse File",
+                font=("Segoe UI", 9, "bold"),
+                bg=self.ACCENT, fg="white",
+                activebackground=self.ACCENT_LIGHT,
+                relief=tk.FLAT, padx=12, pady=4,
+                cursor="hand2",
+                command=self._browse_file
+            )
+            self.btn_browse_file.pack(side=tk.LEFT, padx=(0, 4))
+
+            self.btn_browse_dir = tk.Button(
+                file_row, text="Browse Folder",
+                font=("Segoe UI", 9, "bold"),
+                bg=self.SURFACE2, fg=self.TEXT,
+                activebackground=self.BORDER,
+                relief=tk.FLAT, padx=12, pady=4,
+                cursor="hand2",
+                command=self._browse_directory
+            )
+            self.btn_browse_dir.pack(side=tk.LEFT)
+
+            # --- Mode 2: Git Staged Changes ---
+            mode2_frame = tk.Frame(content, bg=self.SURFACE,
+                                   highlightbackground=self.BORDER,
+                                   highlightthickness=1, padx=16, pady=12)
+            mode2_frame.pack(fill=tk.X, pady=(0, 16))
+
+            mode2_top = tk.Frame(mode2_frame, bg=self.SURFACE)
+            mode2_top.pack(fill=tk.X)
+
+            self.rb_staged = tk.Radiobutton(
+                mode2_top, text="Analyze Staged Git Changes",
+                variable=self.mode, value="staged",
+                font=("Segoe UI", 11, "bold"),
+                fg=self.TEXT, bg=self.SURFACE,
+                selectcolor=self.SURFACE2,
+                activebackground=self.SURFACE,
+                activeforeground=self.ACCENT_LIGHT,
+                command=self._on_mode_change
+            )
+            self.rb_staged.pack(side=tk.LEFT)
+
+            tk.Label(
+                mode2_frame,
+                text="Browse for a git repository — only staged "
+                     "(git add) changes in .c/.h files will be analyzed",
+                font=("Segoe UI", 9),
+                fg=self.TEXT_DIM, bg=self.SURFACE
+            ).pack(anchor=tk.W, pady=(2, 8))
+
+            repo_row = tk.Frame(mode2_frame, bg=self.SURFACE)
+            repo_row.pack(fill=tk.X)
+
+            self.repo_entry = tk.Entry(
+                repo_row, textvariable=self.repo_path,
+                font=("Consolas", 10),
+                bg=self.SURFACE2, fg=self.TEXT,
+                insertbackground=self.TEXT,
+                relief=tk.FLAT, highlightthickness=1,
+                highlightbackground=self.BORDER
+            )
+            self.repo_entry.pack(side=tk.LEFT, fill=tk.X, expand=True,
+                                 ipady=6, padx=(0, 8))
+
+            self.btn_browse_repo = tk.Button(
+                repo_row, text="Browse Repository",
+                font=("Segoe UI", 9, "bold"),
+                bg=self.ACCENT, fg="white",
+                activebackground=self.ACCENT_LIGHT,
+                relief=tk.FLAT, padx=12, pady=4,
+                cursor="hand2",
+                command=self._browse_repo
+            )
+            self.btn_browse_repo.pack(side=tk.LEFT)
+
+            # Staged files info label
+            self.staged_info = tk.Label(
+                mode2_frame, text="",
+                font=("Consolas", 9),
+                fg=self.TEXT_DIM, bg=self.SURFACE,
+                justify=tk.LEFT, anchor=tk.W
+            )
+            self.staged_info.pack(anchor=tk.W, fill=tk.X, pady=(8, 0))
+
+            # ── Settings ─────────────────────────────────────
+            settings_label = tk.Label(
+                content, text="SETTINGS",
+                font=("Segoe UI", 10, "bold"),
+                fg=self.ACCENT_LIGHT, bg=self.BG
+            )
+            settings_label.pack(anchor=tk.W, pady=(0, 8))
+
+            settings_frame = tk.Frame(content, bg=self.SURFACE,
+                                       highlightbackground=self.BORDER,
+                                       highlightthickness=1,
+                                       padx=16, pady=12)
+            settings_frame.pack(fill=tk.X, pady=(0, 16))
+
+            settings_row1 = tk.Frame(settings_frame, bg=self.SURFACE)
+            settings_row1.pack(fill=tk.X, pady=(0, 8))
+
+            tk.Label(
+                settings_row1, text="Minimum Severity:",
+                font=("Segoe UI", 10),
+                fg=self.TEXT, bg=self.SURFACE
+            ).pack(side=tk.LEFT, padx=(0, 8))
+
+            sev_menu = tk.OptionMenu(
+                settings_row1, self.severity,
+                "low", "medium", "high", "critical"
+            )
+            sev_menu.configure(
+                font=("Consolas", 10),
+                bg=self.SURFACE2, fg=self.TEXT,
+                activebackground=self.BORDER,
+                highlightthickness=0, relief=tk.FLAT,
+                width=10
+            )
+            sev_menu["menu"].configure(
+                bg=self.SURFACE2, fg=self.TEXT,
+                activebackground=self.ACCENT,
+                font=("Consolas", 10)
+            )
+            sev_menu.pack(side=tk.LEFT)
+
+            settings_row2 = tk.Frame(settings_frame, bg=self.SURFACE)
+            settings_row2.pack(fill=tk.X, pady=(0, 4))
+
+            tk.Checkbutton(
+                settings_row2,
+                text="Generate LLM Validation Export "
+                     "(for Gemini / GPT review)",
+                variable=self.llm_export,
+                font=("Segoe UI", 10),
+                fg=self.TEXT, bg=self.SURFACE,
+                selectcolor=self.SURFACE2,
+                activebackground=self.SURFACE,
+                activeforeground=self.TEXT
+            ).pack(anchor=tk.W)
+
+            tk.Checkbutton(
+                settings_row2,
+                text="Code Annotations (requires Pillow)",
+                variable=self.annotate,
+                font=("Segoe UI", 10),
+                fg=self.TEXT, bg=self.SURFACE,
+                selectcolor=self.SURFACE2,
+                activebackground=self.SURFACE,
+                activeforeground=self.TEXT
+            ).pack(anchor=tk.W)
+
+            # ── Run Button ───────────────────────────────────
+            self.btn_run = tk.Button(
+                content, text="▶  Run Analysis",
+                font=("Segoe UI", 13, "bold"),
+                bg=self.ACCENT, fg="white",
+                activebackground=self.ACCENT_LIGHT,
+                relief=tk.FLAT, pady=10,
+                cursor="hand2",
+                command=self._run_analysis
+            )
+            self.btn_run.pack(fill=tk.X, pady=(0, 16))
+
+            # ── Status / Log ─────────────────────────────────
+            status_label = tk.Label(
+                content, text="STATUS",
+                font=("Segoe UI", 10, "bold"),
+                fg=self.ACCENT_LIGHT, bg=self.BG
+            )
+            status_label.pack(anchor=tk.W, pady=(0, 6))
+
+            log_frame = tk.Frame(content, bg=self.SURFACE,
+                                  highlightbackground=self.BORDER,
+                                  highlightthickness=1)
+            log_frame.pack(fill=tk.BOTH, expand=True)
+
+            self.log_text = tk.Text(
+                log_frame, font=("Consolas", 9),
+                bg=self.SURFACE, fg=self.TEXT_DIM,
+                relief=tk.FLAT, wrap=tk.WORD,
+                insertbackground=self.TEXT,
+                padx=12, pady=8,
+                state=tk.DISABLED
+            )
+            scrollbar = tk.Scrollbar(
+                log_frame, command=self.log_text.yview,
+                bg=self.SURFACE2, troughcolor=self.SURFACE
+            )
+            self.log_text.configure(yscrollcommand=scrollbar.set)
+            scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+            self.log_text.pack(fill=tk.BOTH, expand=True)
+
+            # Configure text tags for colored output
+            self.log_text.tag_configure("info", foreground=self.TEXT)
+            self.log_text.tag_configure("success",
+                                         foreground=self.SUCCESS)
+            self.log_text.tag_configure("warning",
+                                         foreground=self.MEDIUM)
+            self.log_text.tag_configure("error",
+                                         foreground=self.CRITICAL)
+            self.log_text.tag_configure("accent",
+                                         foreground=self.ACCENT_LIGHT)
+
+            self._log("Ready. Select a mode and browse for your target.",
+                      "info")
+            self._on_mode_change()
+
+        # ── Logging ──────────────────────────────────────────
+
+        def _log(self, msg: str, tag: str = "info"):
+            """Append a message to the status log."""
+            self.log_text.configure(state=tk.NORMAL)
+            self.log_text.insert(tk.END, msg + "\n", tag)
+            self.log_text.see(tk.END)
+            self.log_text.configure(state=tk.DISABLED)
+            self.root.update_idletasks()
+
+        def _clear_log(self):
+            """Clear the status log."""
+            self.log_text.configure(state=tk.NORMAL)
+            self.log_text.delete("1.0", tk.END)
+            self.log_text.configure(state=tk.DISABLED)
+
+        # ── Mode Switching ───────────────────────────────────
+
+        def _on_mode_change(self):
+            """Update UI state based on selected mode."""
+            mode = self.mode.get()
+            is_file = (mode == "file")
+
+            # Visual state for file mode controls
+            state_file = tk.NORMAL if is_file else tk.DISABLED
+            state_repo = tk.DISABLED if is_file else tk.NORMAL
+
+            self.file_entry.configure(state=state_file)
+            self.btn_browse_file.configure(
+                state=state_file,
+                bg=self.ACCENT if is_file else self.BORDER
+            )
+            self.btn_browse_dir.configure(
+                state=state_file,
+                bg=self.SURFACE2 if is_file else self.BORDER
+            )
+
+            self.repo_entry.configure(state=state_repo)
+            self.btn_browse_repo.configure(
+                state=state_repo,
+                bg=self.ACCENT if not is_file else self.BORDER
+            )
+
+        # ── Browse Dialogs ───────────────────────────────────
+
+        def _browse_file(self):
+            """Open file dialog for .c/.h files."""
+            path = filedialog.askopenfilename(
+                title="Select C/H Source File",
+                filetypes=[
+                    ("C Source Files", "*.c"),
+                    ("C Header Files", "*.h"),
+                    ("All C/H Files", "*.c *.h"),
+                    ("All Files", "*.*")
+                ]
+            )
+            if path:
+                self.file_path.set(path)
+                self._log(f"Selected file: {path}", "info")
+
+        def _browse_directory(self):
+            """Open directory dialog for source folder."""
+            path = filedialog.askdirectory(
+                title="Select Directory Containing Source Files"
+            )
+            if path:
+                self.file_path.set(path)
+                # Count .c/.h files in directory
+                count = len(discover_files(path))
+                self._log(
+                    f"Selected directory: {path} "
+                    f"({count} .c/.h files found)", "info"
+                )
+
+        def _browse_repo(self):
+            """Open directory dialog for git repository."""
+            path = filedialog.askdirectory(
+                title="Select Git Repository Root"
+            )
+            if not path:
+                return
+
+            # Validate it's a git repo
+            if not GitAnalyzer.is_git_repo(path):
+                self._log(
+                    f"ERROR: {path} is not a git repository!", "error"
+                )
+                messagebox.showerror(
+                    "Not a Git Repository",
+                    f"The selected directory is not a git repository.\n\n"
+                    f"Path: {path}\n\n"
+                    f"Make sure you select a folder that contains a "
+                    f".git directory."
+                )
+                return
+
+            # Find repo root (in case they selected a subfolder)
+            repo_root = GitAnalyzer.get_repo_root(path) or path
+            self.repo_path.set(repo_root)
+            self._log(f"Repository: {repo_root}", "accent")
+
+            # Check for staged files
+            staged = GitAnalyzer.get_staged_files(repo_root)
+            if not staged:
+                self.staged_info.configure(
+                    text="⚠ No staged .c/.h files found.\n"
+                         "Stage changes first with: git add <file>",
+                    fg=self.MEDIUM
+                )
+                self._log(
+                    "WARNING: No staged .c/.h files. "
+                    "Use 'git add' to stage changes first.", "warning"
+                )
+            else:
+                summary = GitAnalyzer.get_staged_summary(
+                    repo_root, staged
+                )
+                info_lines = [
+                    f"✓ {summary['total_files']} staged file(s), "
+                    f"{summary['total_changed_lines']} changed lines:"
+                ]
+                for f in summary['files']:
+                    info_lines.append(
+                        f"  • {f['name']} "
+                        f"({f['changed_lines']} lines changed)"
+                    )
+                self.staged_info.configure(
+                    text='\n'.join(info_lines),
+                    fg=self.SUCCESS
+                )
+                self._log(
+                    f"Found {summary['total_files']} staged C/H "
+                    f"file(s) with {summary['total_changed_lines']} "
+                    f"changed lines", "success"
+                )
+                for f_info in summary['files']:
+                    self._log(
+                        f"  • {f_info['name']}: "
+                        f"lines {f_info['line_numbers'][:10]}"
+                        f"{'...' if len(f_info['line_numbers']) > 10 else ''}",
+                        "info"
+                    )
+
+        # ── Run Analysis ─────────────────────────────────────
+
+        def _run_analysis(self):
+            """Execute analysis based on selected mode."""
+            if self.is_running:
+                return
+
+            mode = self.mode.get()
+            self._clear_log()
+
+            if mode == "file":
+                self._run_file_analysis()
+            else:
+                self._run_staged_analysis()
+
+        def _run_file_analysis(self):
+            """Mode 1: Analyze specific file(s)."""
+            target = self.file_path.get().strip()
+            if not target:
+                self._log("ERROR: No file or directory selected!", "error")
+                messagebox.showwarning(
+                    "No Target",
+                    "Please browse for a .c/.h file or directory first."
+                )
+                return
+
+            files = discover_files(target)
+            if not files:
+                self._log(
+                    f"ERROR: No .c/.h files found in: {target}", "error"
+                )
+                return
+
+            # Resolve output path
+            script_dir = Path(os.path.dirname(os.path.abspath(__file__)))
+            output_dir = script_dir / "Output"
+            output_path = str(output_dir / "cpu_load_report.html")
+
+            self._execute_analysis(
+                files=files,
+                output_path=output_path,
+                staged_mode=False
+            )
+
+        def _run_staged_analysis(self):
+            """Mode 2: Analyze staged git changes."""
+            repo = self.repo_path.get().strip()
+            if not repo:
+                self._log(
+                    "ERROR: No repository selected!", "error"
+                )
+                messagebox.showwarning(
+                    "No Repository",
+                    "Please browse for a git repository first."
+                )
+                return
+
+            if not GitAnalyzer.is_git_repo(repo):
+                self._log(
+                    f"ERROR: {repo} is not a git repository!", "error"
+                )
+                return
+
+            staged_files = GitAnalyzer.get_staged_files(repo)
+            if not staged_files:
+                self._log(
+                    "ERROR: No staged .c/.h files found!", "error"
+                )
+                self._log(
+                    "Stage changes with: git add <file>", "warning"
+                )
+                messagebox.showwarning(
+                    "No Staged Files",
+                    "No staged .c/.h files found in the repository.\n\n"
+                    "Stage your changes first:\n"
+                    "  git add <file.c>\n"
+                    "  git add .\n\n"
+                    "Then run the analysis again."
+                )
+                return
+
+            # Build staged line map
+            staged_lines = {}
+            for fp in staged_files:
+                lines = GitAnalyzer.get_staged_line_numbers(repo, fp)
+                staged_lines[fp] = lines
+
+            # Output path
+            script_dir = Path(os.path.dirname(os.path.abspath(__file__)))
+            output_dir = script_dir / "Output"
+            output_path = str(
+                output_dir / "cpu_load_staged_report.html"
+            )
+
+            self._execute_analysis(
+                files=staged_files,
+                output_path=output_path,
+                staged_mode=True,
+                repo_path=repo,
+                staged_lines=staged_lines
+            )
+
+        def _execute_analysis(self, files, output_path,
+                               staged_mode=False, repo_path=None,
+                               staged_lines=None):
+            """Run the analysis and update the GUI."""
+            self.is_running = True
+            self.btn_run.configure(
+                text="⏳  Analyzing...",
+                bg=self.BORDER, state=tk.DISABLED
+            )
+            self.root.update_idletasks()
+
+            try:
+                result = run_analysis(
+                    files=files,
+                    output_path=output_path,
+                    min_severity=self.severity.get(),
+                    annotate=self.annotate.get(),
+                    llm_export=self.llm_export.get(),
+                    verbose=False,
+                    staged_mode=staged_mode,
+                    repo_path=repo_path,
+                    staged_lines=staged_lines,
+                    log_callback=lambda msg: self._log(msg, "info")
+                )
+
+                # Show results summary
+                self._log("", "info")
+                self._log("━" * 50, "accent")
+                self._log(
+                    f"  ✓ ANALYSIS COMPLETE "
+                    f"({result['mode']})", "success"
+                )
+                self._log(f"━" * 50, "accent")
+
+                total = result['total_findings']
+                by_sev = result['by_severity']
+
+                self._log(f"  Total: {total} findings", "info")
+                if by_sev.get('CRITICAL', 0) > 0:
+                    self._log(
+                        f"  CRITICAL: {by_sev['CRITICAL']}", "error"
+                    )
+                if by_sev.get('HIGH', 0) > 0:
+                    self._log(
+                        f"  HIGH: {by_sev['HIGH']}", "warning"
+                    )
+                if by_sev.get('MEDIUM', 0) > 0:
+                    self._log(
+                        f"  MEDIUM: {by_sev['MEDIUM']}", "info"
+                    )
+                if by_sev.get('LOW', 0) > 0:
+                    self._log(
+                        f"  LOW: {by_sev['LOW']}", "info"
+                    )
+
+                self._log("", "info")
+                self._log(
+                    f"  Report: {result['report_path']}", "accent"
+                )
+
+                if result.get('llm_export_paths'):
+                    self._log("  LLM Export:", "accent")
+                    for p in result['llm_export_paths']:
+                        self._log(f"    → {p}", "info")
+
+                # Offer to open report
+                if messagebox.askyesno(
+                    "Analysis Complete",
+                    f"Found {total} optimization "
+                    f"opportunities.\n\n"
+                    f"Open the HTML report now?"
+                ):
+                    self._open_report(result['report_path'])
+
+            except Exception as e:
+                self._log(f"\nERROR: {str(e)}", "error")
+                import traceback
+                self._log(traceback.format_exc(), "error")
+                messagebox.showerror("Analysis Error", str(e))
+
+            finally:
+                self.is_running = False
+                self.btn_run.configure(
+                    text="▶  Run Analysis",
+                    bg=self.ACCENT, state=tk.NORMAL
+                )
+
+        def _open_report(self, path):
+            """Open the HTML report in the default browser."""
+            import webbrowser
+            webbrowser.open(f"file://{os.path.abspath(path)}")
+
+        def run(self):
+            """Start the GUI main loop."""
+            self.root.mainloop()
+
+    # Launch the GUI
+    app = OptimizerGUI()
+    app.run()
+
+
+# ============================================================================
+# MAIN CLI
+# ============================================================================
+
+def main():
+    """
+    Entry point — launches GUI if no arguments given,
+    otherwise runs CLI mode.
+
+    Usage:
+        python cpu_load_optimizer.py                  → Launch GUI
+        python cpu_load_optimizer.py --gui             → Launch GUI
+        python cpu_load_optimizer.py <target> [opts]   → CLI mode
+        python cpu_load_optimizer.py --staged <repo>   → Staged changes CLI
+    """
+    # If no arguments or --gui flag, launch GUI
+    if len(sys.argv) == 1 or (len(sys.argv) == 2 and
+                               sys.argv[1] == '--gui'):
+        launch_gui()
+        return
+
+    parser = argparse.ArgumentParser(
+        description="CPU Load Optimizer — Static analysis for embedded C "
+                    "CPU load optimization",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Modes:
+  File mode (default):
+    python cpu_load_optimizer.py src/sensor.c
+    python cpu_load_optimizer.py ./platform/ -o report.html -s high
+
+  Staged changes mode:
+    python cpu_load_optimizer.py --staged /path/to/repo
+    python cpu_load_optimizer.py --staged . -s critical --llm-export
+
+  GUI mode:
+    python cpu_load_optimizer.py
+    python cpu_load_optimizer.py --gui
+
+Rules Reference:
+  25+ verified optimization rules based on MISRA C:2012,
+  ARM Architecture Manual, Renesas AppNotes, and GCC documentation.
+  No LLM dependency — fully deterministic, offline analysis.
+        """
+    )
+    parser.add_argument("target", nargs='?', default=None,
+                        help="Path to .c/.h file or directory "
+                             "(not used in --staged mode)")
+    parser.add_argument("--gui", action="store_true",
+                        help="Launch graphical interface")
+    parser.add_argument("--staged", metavar="REPO_PATH", default=None,
+                        help="Analyze only staged git changes "
+                             "in the given repository")
+    parser.add_argument("-o", "--output", default=None,
+                        help="Output HTML report path "
+                             "(default: Output/cpu_load_report.html)")
+    parser.add_argument("-s", "--severity", default="low",
+                        choices=["critical", "high", "medium", "low"],
+                        help="Minimum severity to report")
+    parser.add_argument("--annotate", action="store_true",
+                        help="Enable code screenshot annotations "
+                             "(needs Pillow)")
+    parser.add_argument("--llm-export", action="store_true",
+                        help="Generate LLM-optimized validation "
+                             "export for Gemini/GPT review")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="Print findings to console")
+
+    args = parser.parse_args()
+
+    if args.gui:
+        launch_gui()
+        return
+
+    # ── Resolve output path ──────────────────────────────────
+    if args.output is None:
+        script_dir = Path(os.path.dirname(os.path.abspath(__file__)))
+        output_dir = script_dir / "Output"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        if args.staged:
+            args.output = str(
+                output_dir / "cpu_load_staged_report.html"
+            )
+        else:
+            args.output = str(output_dir / "cpu_load_report.html")
+        print(f"  Output directory: {output_dir}")
+    else:
+        output_path = Path(args.output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # ── Staged changes mode ──────────────────────────────────
+    if args.staged:
+        repo_path = os.path.abspath(args.staged)
+
+        if not GitAnalyzer.is_git_repo(repo_path):
+            print(f"ERROR: {repo_path} is not a git repository!")
+            sys.exit(1)
+
+        repo_root = GitAnalyzer.get_repo_root(repo_path) or repo_path
+        staged_files = GitAnalyzer.get_staged_files(repo_root)
+
+        if not staged_files:
+            print("No staged .c/.h files found.")
+            print("Stage changes with: git add <file>")
+            sys.exit(1)
+
+        # Build staged line map
+        staged_lines = {}
+        for fp in staged_files:
+            lines = GitAnalyzer.get_staged_line_numbers(repo_root, fp)
+            staged_lines[fp] = lines
+            print(f"  Staged: {os.path.basename(fp)} "
+                  f"({len(lines)} changed lines)")
+
+        run_analysis(
+            files=staged_files,
+            output_path=args.output,
+            min_severity=args.severity,
+            annotate=args.annotate,
+            llm_export=args.llm_export,
+            verbose=args.verbose,
+            staged_mode=True,
+            repo_path=repo_root,
+            staged_lines=staged_lines
+        )
+        return
+
+    # ── File mode (default) ──────────────────────────────────
+    if not args.target:
+        print("Error: No target specified. Use --help for usage.")
+        sys.exit(1)
+
+    files = discover_files(args.target)
+    if not files:
+        print("No .c or .h files found.")
+        sys.exit(1)
+
+    run_analysis(
+        files=files,
+        output_path=args.output,
+        min_severity=args.severity,
+        annotate=args.annotate,
+        llm_export=args.llm_export,
+        verbose=args.verbose,
+    )
 
 
 if __name__ == "__main__":
