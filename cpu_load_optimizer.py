@@ -2620,30 +2620,60 @@ class GitAnalyzer:
     Uses git CLI via subprocess (no gitpython dependency).
     Parses unified diff to identify exactly which lines changed,
     then filters analysis findings to only report issues on those lines.
+
+    Path handling:
+    - All internal paths are normalized via os.path.normpath()
+    - All paths passed to git commands use forward slashes
+      (git uses forward slashes internally, even on Windows)
+    - Handles MSYS2/Git-Bash vs native Windows path mismatches
     """
+
+    @staticmethod
+    def _to_git_path(path: str) -> str:
+        """Convert OS path to git-compatible path (forward slashes)."""
+        return path.replace('\\', '/')
+
+    @staticmethod
+    def _normalize(path: str) -> str:
+        """Normalize a path for consistent comparison."""
+        return os.path.normpath(os.path.abspath(path))
 
     @staticmethod
     def is_git_repo(path: str) -> bool:
         """Check if the given path is inside a git repository."""
         try:
             result = subprocess.run(
-                ['git', '-C', path, 'rev-parse', '--is-inside-work-tree'],
+                ['git', '-C', path, 'rev-parse',
+                 '--is-inside-work-tree'],
                 capture_output=True, text=True, timeout=5
             )
-            return result.returncode == 0 and result.stdout.strip() == 'true'
+            return (result.returncode == 0 and
+                    result.stdout.strip() == 'true')
         except (FileNotFoundError, subprocess.TimeoutExpired):
             return False
 
     @staticmethod
     def get_repo_root(path: str) -> Optional[str]:
-        """Get the root directory of the git repository."""
+        """
+        Get the root directory of the git repository.
+
+        Handles MSYS2 path translation on Windows:
+        git may return '/c/Users/...' but we need 'C:\\Users\\...'
+        """
         try:
             result = subprocess.run(
-                ['git', '-C', path, 'rev-parse', '--show-toplevel'],
+                ['git', '-C', path, 'rev-parse',
+                 '--show-toplevel'],
                 capture_output=True, text=True, timeout=5
             )
             if result.returncode == 0:
-                return result.stdout.strip()
+                root = result.stdout.strip()
+                # Handle MSYS2 paths on Windows:
+                #   /c/Users/... → C:\Users\...
+                if (os.name == 'nt' and root.startswith('/') and
+                        len(root) > 2 and root[2] == '/'):
+                    root = root[1].upper() + ':' + root[2:]
+                return os.path.normpath(root)
         except (FileNotFoundError, subprocess.TimeoutExpired):
             pass
         return None
@@ -2653,8 +2683,9 @@ class GitAnalyzer:
         """
         Get list of staged .c/.h files (added or modified).
 
-        Returns absolute paths to the staged files.
+        Returns normalized absolute paths to the staged files.
         """
+        repo_path = GitAnalyzer._normalize(repo_path)
         try:
             result = subprocess.run(
                 ['git', '-C', repo_path, 'diff', '--cached',
@@ -2666,12 +2697,15 @@ class GitAnalyzer:
 
             all_files = result.stdout.strip().split('\n')
             c_h_files = [
-                f for f in all_files
-                if f.strip() and (f.endswith('.c') or f.endswith('.h'))
+                f.strip() for f in all_files
+                if f.strip() and
+                (f.strip().endswith('.c') or
+                 f.strip().endswith('.h'))
             ]
-            # Convert to absolute paths
+            # Convert to normalized absolute paths
             return [
-                os.path.join(repo_path, f) for f in c_h_files
+                os.path.normpath(os.path.join(repo_path, f))
+                for f in c_h_files
             ]
         except (FileNotFoundError, subprocess.TimeoutExpired):
             return []
@@ -2683,19 +2717,19 @@ class GitAnalyzer:
         Parse 'git diff --cached' to extract the exact line numbers
         that were added or modified in the staged version.
 
-        Returns a set of 1-based line numbers representing changed lines.
-
-        How it works:
-        - Unified diff headers look like: @@ -old,count +new,count @@
-        - Lines starting with '+' (but not '+++') are additions
-        - We track the current line number in the new (staged) version
-        - Only '+' lines are "changed" — context lines are unchanged
+        Returns a set of 1-based line numbers representing changed
+        lines in the NEW (staged) version of the file.
         """
+        repo_path = GitAnalyzer._normalize(repo_path)
+        file_path = GitAnalyzer._normalize(file_path)
         rel_path = os.path.relpath(file_path, repo_path)
+        # Git requires forward slashes, even on Windows
+        git_rel = GitAnalyzer._to_git_path(rel_path)
+
         try:
             result = subprocess.run(
-                ['git', '-C', repo_path, 'diff', '--cached', '-U0',
-                 '--', rel_path],
+                ['git', '-C', repo_path, 'diff', '--cached',
+                 '-U0', '--', git_rel],
                 capture_output=True, text=True, timeout=10
             )
             if result.returncode != 0:
@@ -2704,41 +2738,72 @@ class GitAnalyzer:
             return set()
 
         changed_lines = set()
-        current_line = 0
 
         for line in result.stdout.split('\n'):
-            # Parse hunk header: @@ -old_start,old_count +new_start,new_count @@
+            # Parse hunk header:
+            #   @@ -old_start,old_count +new_start,new_count @@
             hunk_match = re.match(
                 r'^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@', line
             )
             if hunk_match:
                 start = int(hunk_match.group(1))
-                count = int(hunk_match.group(2)) if hunk_match.group(2) else 1
+                count = (int(hunk_match.group(2))
+                         if hunk_match.group(2) else 1)
                 # With -U0, all lines in the range are changes
                 for i in range(count):
                     changed_lines.add(start + i)
-                continue
 
         return changed_lines
 
     @staticmethod
-    def get_staged_content(repo_path: str, file_path: str) -> Optional[str]:
+    def get_staged_content(repo_path: str,
+                            file_path: str,
+                            log_callback=None) -> Optional[str]:
         """
         Get the staged version of a file (not the working copy).
 
-        This is important: the working copy might have unstaged changes.
-        We want to analyze exactly what will be committed.
+        Falls back to reading the working copy if git show fails,
+        with a warning — this ensures analysis still runs even if
+        the git index access doesn't work on the user's system.
         """
+        def log(msg):
+            if log_callback:
+                log_callback(msg)
+
+        repo_path = GitAnalyzer._normalize(repo_path)
+        file_path = GitAnalyzer._normalize(file_path)
         rel_path = os.path.relpath(file_path, repo_path)
+        git_rel = GitAnalyzer._to_git_path(rel_path)
+
+        # Method 1: Read from git index (staged version)
         try:
             result = subprocess.run(
-                ['git', '-C', repo_path, 'show', f':{rel_path}'],
+                ['git', '-C', repo_path, 'show',
+                 f':{git_rel}'],
                 capture_output=True, text=True, timeout=10
             )
-            if result.returncode == 0:
+            if result.returncode == 0 and result.stdout:
                 return result.stdout
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            pass
+            else:
+                log(f"    ⚠ git show :{git_rel} failed "
+                    f"(rc={result.returncode})")
+                if result.stderr.strip():
+                    log(f"      git error: "
+                        f"{result.stderr.strip()[:120]}")
+        except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+            log(f"    ⚠ git show failed: {e}")
+
+        # Method 2: Fallback to working copy
+        if os.path.isfile(file_path):
+            log(f"    ⚠ Falling back to working copy "
+                f"(may include unstaged changes)")
+            try:
+                with open(file_path, 'r', encoding='utf-8',
+                          errors='replace') as f:
+                    return f.read()
+            except Exception as e:
+                log(f"    ✗ Cannot read file: {e}")
+
         return None
 
     @staticmethod
@@ -2848,25 +2913,52 @@ def run_analysis(files: List[str],
         try:
             if staged_mode and repo_path:
                 # Read the STAGED version, not the working copy
-                source = GitAnalyzer.get_staged_content(repo_path, fp)
+                source = GitAnalyzer.get_staged_content(
+                    repo_path, fp, log_callback=log
+                )
                 if source is None:
-                    log(f"    → Error: cannot read staged content")
+                    log(f"    ✗ Error: cannot read staged content "
+                        f"for {os.path.basename(fp)}")
+                    continue
+                if not source.strip():
+                    log(f"    ⚠ Warning: staged content is empty")
                     continue
             else:
-                with open(fp, 'r', encoding='utf-8', errors='replace') as f:
+                with open(fp, 'r', encoding='utf-8',
+                          errors='replace') as f:
                     source = f.read()
 
             findings = engine.analyze(source, fp, min_sev)
 
             # Filter to staged lines only if in staged mode
-            if staged_mode and staged_lines and fp in staged_lines:
-                changed = staged_lines[fp]
-                before_count = len(findings)
-                findings = [
-                    f for f in findings if f.line_number in changed
-                ]
-                log(f"    → {before_count} total findings, "
-                    f"{len(findings)} on staged lines")
+            if staged_mode and staged_lines:
+                # Normalize path for lookup (handles Windows
+                # backslash vs forward slash mismatches)
+                norm_fp = os.path.normpath(os.path.abspath(fp))
+                changed = None
+                for key, val in staged_lines.items():
+                    norm_key = os.path.normpath(
+                        os.path.abspath(key)
+                    )
+                    if norm_key == norm_fp:
+                        changed = val
+                        break
+
+                if changed is not None:
+                    before_count = len(findings)
+                    findings = [
+                        f for f in findings
+                        if f.line_number in changed
+                    ]
+                    log(f"    → {before_count} total findings, "
+                        f"{len(findings)} on staged lines "
+                        f"(changed lines: "
+                        f"{sorted(changed)[:8]}"
+                        f"{'...' if len(changed) > 8 else ''})")
+                else:
+                    log(f"    ⚠ No staged line data for this "
+                        f"file — showing all "
+                        f"{len(findings)} findings")
             else:
                 log(f"    → {len(findings)} finding(s)")
 
@@ -2902,7 +2994,9 @@ def run_analysis(files: List[str],
         for fp in files:
             try:
                 if staged_mode and repo_path:
-                    content = GitAnalyzer.get_staged_content(repo_path, fp)
+                    content = GitAnalyzer.get_staged_content(
+                        repo_path, fp, log_callback=log
+                    )
                     if content:
                         source_contents[fp] = content
                 else:
