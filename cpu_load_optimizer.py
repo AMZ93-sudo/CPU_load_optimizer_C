@@ -2379,15 +2379,51 @@ class LLMValidationExport:
         with open(prompt_path, 'w', encoding='utf-8') as f:
             f.write(prompt_text)
 
-        # ── File 3: Instructions ─────────────────────────────────────
+        # ── File 3: HTML Report Template (CSS shell + placeholders) ─────
+        template_html = LLMValidationExport._build_report_template(
+            findings, files_analyzed
+        )
+        template_path = os.path.join(output_dir, "report_template.html")
+        with open(template_path, 'w', encoding='utf-8') as f:
+            f.write(template_html)
+
+        # ── File 4: Instructions ─────────────────────────────────────
         instructions = LLMValidationExport._build_instructions(
-            files_analyzed, findings_path, prompt_path
+            files_analyzed, findings_path, prompt_path, template_path
         )
         instructions_path = os.path.join(output_dir, "HOW_TO_VALIDATE.md")
         with open(instructions_path, 'w', encoding='utf-8') as f:
             f.write(instructions)
 
-        return findings_path, prompt_path, instructions_path
+        # ── File 5: Findings JSON Cache (for validated report generation) ──
+        cache_path = os.path.join(output_dir, "findings_cache.json")
+        cache_data = {
+            "generated": datetime.now().strftime('%Y-%m-%d %H:%M'),
+            "files_analyzed": files_analyzed,
+            "total": len(findings),
+            "findings": [
+                {
+                    "rule_id": f.rule_id,
+                    "rule_name": f.rule_name,
+                    "severity": int(f.severity),
+                    "category": f.category,
+                    "file_path": f.file_path,
+                    "line_number": f.line_number,
+                    "code_snippet": f.code_snippet,
+                    "matched_text": f.matched_text,
+                    "description": f.description,
+                    "recommendation": f.recommendation,
+                    "suggested_fix": f.suggested_fix,
+                    "evidence": f.evidence,
+                    "impact_score": f.impact_score,
+                }
+                for f in findings
+            ]
+        }
+        with open(cache_path, 'w', encoding='utf-8') as f:
+            json.dump(cache_data, f, indent=2)
+
+        return findings_path, prompt_path, template_path, instructions_path, cache_path
 
     @staticmethod
     def _build_findings_export(findings: List[Finding],
@@ -2467,10 +2503,23 @@ class LLMValidationExport:
                     f"- **Suggested fix**: {f.suggested_fix}"
                 )
 
+                # Pre-calculated CPU reduction estimate (for LLM HTML generation)
+                base = ReportGenerator.REDUCTION_MAP.get(f.rule_id, 0.1)
+                cpu_min = round(base * 0.4, 2)
+                cpu_max = round(base, 2)
+                lines.append(
+                    f"- **CPU Reduction Estimate**: "
+                    f"{cpu_min}% – {cpu_max}% per finding "
+                    f"(low-freq path → high-freq path)"
+                )
+
                 # Evidence only on first occurrence
                 if is_first:
                     lines.append(
                         f"- **Evidence**: {f.evidence[:150]}"
+                    )
+                    lines.append(
+                        f"- **Recommendation**: {f.recommendation[:200]}"
                     )
 
                 lines.append("")
@@ -2480,133 +2529,1488 @@ class LLMValidationExport:
     @staticmethod
     def _build_validation_prompt(findings: List[Finding],
                                   files_analyzed: List[str]) -> str:
-        """Build the actual prompt to paste into Gemini."""
+        """
+        Build the validation prompt.
 
-        # Count unique rules
+        This prompt instructs the LLM to:
+          1. Review every finding in findings_for_review.md
+          2. Filter to CONFIRMED true positives only
+          3. Output a complete, self-contained HTML developer action report
+             (using the provided CSS template) — ready to open in a browser.
+        """
         unique_rules = set(f.rule_id for f in findings)
         sev_counts = Counter(f.severity_name for f in findings)
+        files_str = ', '.join(os.path.basename(f) for f in files_analyzed)
 
-        prompt = f"""You are an embedded systems expert reviewing CPU load optimization findings from a static analysis tool. The tool analyzed embedded C source code for an ultrasonic sensor platform and produced the findings attached in "findings_for_review.md".
+        # Pre-compute total reduction for context
+        cpu_est = ReportGenerator.estimate_cpu_reduction(findings)
+        t_min = cpu_est['TOTAL']['min_pct']
+        t_max = cpu_est['TOTAL']['max_pct']
 
-## YOUR TASK
+        prompt = f"""You are a senior embedded systems engineer reviewing static analysis findings for CPU load optimization. The tool analyzed: **{files_str}** and found **{len(findings)} findings** across {len(unique_rules)} unique rules.
 
-For each finding in the attached findings document, provide:
+Severity breakdown: {dict(sev_counts)}
+Pre-calculated total CPU reduction if ALL findings were real: {t_min}% – {t_max}%
 
-1. **VERDICT**: One of:
-   - **CONFIRMED** — This is a real optimization opportunity that will reduce CPU load
-   - **FALSE POSITIVE** — The tool flagged this incorrectly; this code is already optimal or the rule doesn't apply here
-   - **CONTEXT NEEDED** — Cannot determine without knowing runtime behavior (e.g., how often this code executes)
-   - **PARTIAL** — The issue exists but the impact is different than stated
+---
 
-2. **REASONING** (1-2 sentences): Why you reached this verdict, referencing the specific code.
+## STEP 1 — Classify Each Finding
 
-3. **REVISED IMPACT** (optional): If you disagree with the impact score, suggest a revised one.
+Review every finding in the attached `findings_for_review.md`.
+For each one decide:
 
-## WHAT TO LOOK FOR
+| Verdict | Meaning |
+|---------|---------|
+| **CONFIRMED** | Real optimization opportunity — will reduce CPU load |
+| **FALSE POSITIVE** | Tool flagged incorrectly; code is already optimal |
+| **CONTEXT NEEDED** | Cannot determine without knowing runtime call frequency |
+| **PARTIAL** | Issue exists but CPU impact differs from stated estimate |
 
-The tool uses regex-based pattern matching, so it may:
-- Flag struct member declarations as "uninitialized variables" (they're initialized when the struct is used)
-- Flag divisions that the compiler already optimizes at -O2
-- Miss context about whether code is in a hot path or cold path
-- Flag standard library functions as "function calls in loops" even though they're already optimized
-- Not know if a float variable genuinely needs floating-point precision
+The tool uses regex-based pattern matching and commonly:
+- Flags struct member declarations as "uninitialized variables"
+- Flags divisions that GCC already optimizes at -O2 with power-of-2 divisors
+- Flags standard lib functions in loops that are already inlined
+- Cannot know if a float variable genuinely needs FP precision
+- Cannot distinguish hot path (10 kHz) from cold path (init code)
 
-## FORMAT YOUR RESPONSE AS
+Be rigorous. Only CONFIRMED or PARTIAL findings enter the final report.
 
-For each finding, use this format:
+---
+
+## STEP 2 — Generate the Developer Action Report (HTML)
+
+**Output a single, complete, self-contained HTML file** that is the
+developer action report. This file will be saved and opened directly
+in a browser by the developer — it must be 100% complete HTML.
+
+### Rules for the HTML output
+- Include ONLY findings you classified as CONFIRMED or PARTIAL
+- Sort findings by CPU impact score (highest first)
+- Use the **exact CSS and HTML structure** from `report_template.html`
+  (which was generated alongside this prompt)
+- For each confirmed finding, fill in one `<div class="card">` block
+- In the hero section, show ACTUAL totals:
+  - Total confirmed findings count
+  - False positives removed count
+  - ACTUAL total CPU reduction (sum confirmed findings' CPU Reduction Estimates,
+    capped at the percentages shown in the template)
+- At the end of each finding card, add your reasoning in the
+  `<div class="llm-block">` section
+
+### Start your response with:
 ```
-[RULE_ID] Rule Name — Line(s)
-VERDICT: CONFIRMED | FALSE POSITIVE | CONTEXT NEEDED | PARTIAL
-REASONING: ...
+<!DOCTYPE html>
+```
+### End your response with:
+```
+</html>
 ```
 
-Then at the end, provide:
-- **Overall accuracy estimate**: What percentage of findings are valid?
-- **Top 3 most impactful findings**: Which ones should be fixed first?
-- **Missed opportunities**: Anything the tool missed that you can see in the source code?
+Do NOT include any text, explanation, or markdown fences outside the HTML tags.
+The entire response must be a valid, complete HTML file.
+
+---
 
 ## CONTEXT
 
-- This is embedded C for an automotive ultrasonic sensor platform
-- Target MCU likely ARM Cortex-M based (common for automotive sensors)
-- Code runs in real-time loops, so CPU load optimization is critical
-- The team's goal is measurable CPU load reduction
-
-Please be rigorous and specific. The team will use your review to prioritize their optimization work.
+- Embedded C for an automotive ultrasonic sensor platform
+- Target: ARM Cortex-M series MCU (automotive grade)
+- Real-time loops running at 10–50 kHz; CPU budget is critical
+- Each finding's CPU Reduction Estimate is pre-calculated using ARM
+  Cortex-M instruction cycle timing (included in findings_for_review.md)
+- The developer will use this HTML as their sole implementation guide —
+  make it precise, actionable, and complete.
 """
         return prompt
 
     @staticmethod
     def _build_instructions(files_analyzed: List[str],
                             findings_path: str,
-                            prompt_path: str) -> str:
-        """Build step-by-step instructions for the user."""
+                            prompt_path: str,
+                            template_path: str = "") -> str:
+        """Build step-by-step instructions for the new HTML-generation workflow."""
         source_files = '\n'.join(
             f"   - `{os.path.basename(f)}`" for f in files_analyzed
         )
+        template_name = (os.path.basename(template_path)
+                         if template_path else "report_template.html")
 
-        return f"""# How to Validate Findings with Gemini 3 Pro
+        return f"""# How to Generate the Developer Action Report via LLM
+
+## What You Will Get
+
+The LLM will output a **complete, self-contained HTML file** that is your
+developer action report. It contains ONLY confirmed True Positive findings,
+sorted by CPU impact, with before/after code and implementation guidance.
+Save that HTML output → open in browser → hand to developer.
+
+---
 
 ## Step-by-Step Process
 
-### Step 1: Open Gemini 3 Pro
-Go to your company-approved Gemini web interface.
+### Step 1 — Open Your LLM (Gemini Pro / GPT-4o)
+Use the web interface with file-upload support.
 
-### Step 2: Upload Files (in this order)
+### Step 2 — Upload Files (in this exact order)
 
-**Upload 1 — The source code file(s):**
+**Upload 1 — Source code file(s):**
 {source_files}
-   These are the original C files that were analyzed.
 
-**Upload 2 — The findings summary:**
+**Upload 2 — Findings summary (pre-calculated CPU estimates included):**
    - `findings_for_review.md`
-   This is a compact, LLM-optimized summary of all findings.
-   (~2000 tokens vs ~50,000 tokens for the HTML report)
 
-### Step 3: Paste the Validation Prompt
-Open `validation_prompt.md` and copy-paste its ENTIRE content
-into the Gemini chat as your message.
+**Upload 3 — HTML Report Template (CSS + structure shell):**
+   - `{template_name}`
+   The LLM will fill this template with confirmed findings.
 
-### Step 4: Review Gemini's Response
-Gemini will go through each finding and give a verdict:
-- **CONFIRMED** → Fix this, it's real
-- **FALSE POSITIVE** → Ignore, remove from your action list
-- **CONTEXT NEEDED** → You need to decide based on your domain knowledge
-- **PARTIAL** → Consider with adjusted priority
+### Step 3 — Paste the Validation Prompt
+Open `validation_prompt.md`, copy its **entire content**, and paste it
+into the LLM chat as your message. Press Send.
 
-### Step 5: Create Your Action Plan
-Filter findings to only CONFIRMED ones, sort by impact score,
-and start fixing from the top.
+### Step 4 — Save the LLM Response as HTML
+The LLM will respond with a raw HTML document (starting with `<!DOCTYPE html>`).
+1. Select all of the LLM's response text
+2. Paste it into a new file named `validated_action_report.html`
+3. Save it in this `llm_validation/` folder
+4. Open it in your browser
 
-## Why This Approach (Not HTML Upload)
+That HTML file IS the developer's implementation guide — no further
+processing needed.
 
-| Approach | Tokens Used | LLM Thinking Room | Quality |
-|----------|-------------|-------------------|---------|
-| HTML report + source | ~60,000 | Low | Poor — LLM wastes tokens on CSS/JS |
-| JSON findings + source | ~8,000 | High | Good |
-| **This export + source** | **~4,000** | **Maximum** | **Best** |
+### Step 5 — Share with Developer
+Hand the `validated_action_report.html` file to your developer.
+The report contains everything they need:
+  - Only real (LLM-confirmed) findings
+  - Exact file + line + problematic code
+  - Suggested fix with implementation steps
+  - Estimated CPU load reduction per fix
+  - LLM's reasoning for each confirmation
 
-The compact markdown export gives the LLM all the information it needs
-(rule ID, location, code sample, evidence) without any visual formatting
-overhead. This means Gemini can spend its context window actually
-ANALYZING your code instead of parsing HTML tags.
+---
+
+## Token Efficiency
+
+| Approach | Tokens Used | LLM Quality |
+|----------|-------------|-------------|
+| Upload full HTML report | ~60,000 | Poor — LLM reads CSS/JS |
+| This export + template | ~5,000–8,000 | **Best — LLM thinks, not formats** |
+
+The CSS is pre-written in `{template_name}`. The LLM only fills in
+data — it doesn't waste context generating styles.
+
+---
 
 ## Pro Tips
 
-1. **Split large codebases**: If you have 10+ source files, validate
-   in batches of 3-4 files per Gemini session for best quality.
+1. **Large codebases**: Validate in batches of 3–4 source files per
+   LLM session for highest accuracy.
 
-2. **Follow up on CONTEXT NEEDED**: For those findings, tell Gemini
-   specifics like "this function runs at 10kHz in the main sensor loop"
-   and ask it to re-evaluate.
+2. **CONTEXT NEEDED findings**: Tell Gemini the call frequency:
+   "This function runs at 10 kHz in the main sensor loop — re-evaluate."
 
-3. **Ask for missed findings**: After validation, ask Gemini:
-   "Looking at the source code, are there any CPU optimization
-   opportunities that the tool missed?"
+3. **Missed findings**: After the report, ask:
+   "Are there CPU optimization opportunities in the source code that
+   the static analysis tool missed?"
 
-4. **Save the validated results**: Copy Gemini's response and save it
-   alongside the HTML report for documentation.
+4. **Partial findings**: The LLM may classify some as PARTIAL (issue real,
+   but impact is lower). These are still included in the report — review
+   them case by case.
 """
+
+    @staticmethod
+    def _build_report_template(findings: List[Finding],
+                               files_analyzed: List[str]) -> str:
+        """
+        Build the HTML shell (CSS + empty data sections) that the LLM fills in.
+
+        The template contains:
+        - Complete CSS (dark developer theme)
+        - Skeleton HTML structure with clearly marked placeholder comments
+        - One fully-worked example card so the LLM knows the exact format
+        - Pre-calculated CPU reduction totals for reference
+        """
+        now = datetime.now().strftime('%Y-%m-%d %H:%M')
+        files_str = ', '.join(os.path.basename(f) for f in files_analyzed)
+        total_findings = len(findings)
+
+        # Pre-calculate totals (LLM uses these for the hero section)
+        cpu_est = ReportGenerator.estimate_cpu_reduction(findings)
+        t_min = cpu_est['TOTAL']['min_pct']
+        t_max = cpu_est['TOTAL']['max_pct']
+
+        # Build a sample card from the highest-impact finding (if any)
+        sample_card = ""
+        if findings:
+            ex = max(findings, key=lambda f: f.impact_score)
+            base = ReportGenerator.REDUCTION_MAP.get(ex.rule_id, 0.1)
+            ex_min = round(base * 0.4, 2)
+            ex_max = round(base, 2)
+            sev_colors = {
+                "CRITICAL": "#dc2626", "HIGH": "#ea580c",
+                "MEDIUM": "#ca8a04",   "LOW": "#2563eb",
+            }
+            sev_bgs = {
+                "CRITICAL": "#3b0a0a", "HIGH": "#2d1306",
+                "MEDIUM": "#2b2000",   "LOW": "#0a1a3b",
+            }
+            clr = sev_colors.get(ex.severity_name, "#6b7280")
+            bg = sev_bgs.get(ex.severity_name, "#1a1a2e")
+            sample_card = f"""
+    <!-- ═══════ EXAMPLE CARD — replicate this structure for every confirmed finding ═══════ -->
+    <div class="card" id="f1">
+      <div class="card-head" style="background:{bg};border-left:5px solid {clr}">
+        <div class="ch-top">
+          <span class="ch-num">#1</span>
+          <span class="ch-sev" style="background:{clr}">{html.escape(ex.severity_name)}</span>
+          <span class="ch-id">{html.escape(ex.rule_id)}</span>
+          <span class="ch-name">{html.escape(ex.rule_name)}</span>
+          <div class="cpu-tag"><span>⚡</span><span>▼&nbsp;{ex_min}%&nbsp;–&nbsp;{ex_max}%&nbsp;CPU</span></div>
+        </div>
+        <div class="ch-meta">
+          <span>📁&nbsp;<strong>{html.escape(os.path.basename(ex.file_path))}</strong>&nbsp;:&nbsp;Line&nbsp;{ex.line_number}</span>
+          <span>📊&nbsp;Impact&nbsp;<strong>{ex.impact_score}/100</strong></span>
+          <span>🏷&nbsp;{html.escape(ex.category)}</span>
+          <span class="verdict-chip v-confirmed">✅&nbsp;CONFIRMED</span>
+        </div>
+      </div>
+      <div class="card-body">
+        <div class="section-block issue-block">
+          <div class="block-title">⚠&nbsp;Issue</div>
+          <p class="block-text">{html.escape(ex.description)}</p>
+        </div>
+        <div class="code-duo">
+          <div class="code-panel before-panel">
+            <div class="panel-label err-label">❌&nbsp;Problematic Code&nbsp;—&nbsp;Line {ex.line_number}</div>
+            <pre class="code-pre"><code>{html.escape(ex.code_snippet)}</code></pre>
+          </div>
+          <div class="code-panel after-panel">
+            <div class="panel-label ok-label">✅&nbsp;Suggested Fix</div>
+            <pre class="code-pre"><code>{html.escape(ex.suggested_fix)}</code></pre>
+          </div>
+        </div>
+        <div class="section-block impl-block">
+          <div class="block-title">📋&nbsp;Implementation Steps</div>
+          <p class="block-text">{html.escape(ex.recommendation)}</p>
+        </div>
+        <div class="section-block llm-block">
+          <div class="block-title">🤖&nbsp;LLM Verification Reasoning</div>
+          <div class="llm-box v-confirmed">
+            <span class="llm-verdict">CONFIRMED</span>
+            <span class="llm-text"><!-- FILL IN: Your reasoning why this is a true positive --></span>
+          </div>
+        </div>
+        <details class="evidence-details">
+          <summary class="ev-summary">📚&nbsp;Technical Evidence &amp; References</summary>
+          <p class="ev-text">{html.escape(ex.evidence)}</p>
+        </details>
+      </div>
+    </div>
+    <!-- ═══════ END EXAMPLE CARD ═══════ -->"""
+
+        return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>CPU Optimizer — Developer Action Report</title>
+  <!--
+  ═══════════════════════════════════════════════════════════════════
+  REPORT TEMPLATE — CPU Load Optimizer / LLM Validation
+  ═══════════════════════════════════════════════════════════════════
+  HOW TO USE THIS TEMPLATE (LLM Instructions):
+
+  1. Review findings_for_review.md and classify each finding.
+  2. Replace every <!-- FILL IN: ... --> comment with the actual data.
+  3. In the <body>, add one <div class="card"> per CONFIRMED finding.
+  4. Update the hero stats (#CONFIRMED_COUNT, CPU %, etc.).
+  5. Build the priority nav (#NAV_ITEMS_HERE) and severity table rows.
+  6. Remove all <!-- FILL IN: ... --> comments from your final output.
+  7. Output the complete HTML as your ENTIRE response (no extra text).
+
+  PRE-CALCULATED DATA FOR YOUR REFERENCE:
+    Total raw findings : {total_findings}
+    Max CPU reduction  : {t_min}% – {t_max}% (if all were real)
+    Analysis date      : {now}
+    Source files       : {files_str}
+  ═══════════════════════════════════════════════════════════════════
+  -->
+  <style>
+    :root {{
+      --bg:#0f0f17;--surf:#1a1a2e;--surf2:#222240;--border:#2d2d4a;
+      --text:#e2e2f0;--dim:#8888a8;--accent:#6c5ce7;--acc-lt:#a78bfa;
+      --green:#16a34a;--green-bg:#052e16;--amber:#ca8a04;--amber-bg:#1c1400;
+    }}
+    *,*::before,*::after{{box-sizing:border-box;margin:0;padding:0}}
+    html{{scroll-behavior:smooth}}
+    body{{font-family:"Segoe UI",system-ui,sans-serif;background:var(--bg);
+          color:var(--text);min-height:100vh;line-height:1.6}}
+    .hero{{background:linear-gradient(135deg,#1a1a40,#0f0f17);
+           border-bottom:1px solid var(--border);padding:2.5rem 2rem 2rem}}
+    .hero-inner{{max-width:1100px;margin:0 auto}}
+    .hero-badge{{display:inline-block;background:var(--green-bg);color:#4ade80;
+                 border:1px solid var(--green);border-radius:20px;font-size:.75rem;
+                 font-weight:700;letter-spacing:.08em;padding:.25rem .9rem;
+                 margin-bottom:1rem;text-transform:uppercase}}
+    .hero h1{{font-size:1.9rem;font-weight:800;color:#fff;margin-bottom:.35rem}}
+    .hero-sub{{color:var(--dim);font-size:.9rem;margin-bottom:1.8rem}}
+    .hero-sub strong{{color:var(--acc-lt)}}
+    .reduction-banner{{display:flex;align-items:center;gap:2rem;
+      background:linear-gradient(90deg,#14532d20,#052e1640);
+      border:1px solid #16a34a50;border-radius:12px;padding:1.2rem 1.8rem;
+      margin-bottom:1.8rem;flex-wrap:wrap}}
+    .rb-main{{flex:0 0 auto;text-align:center}}
+    .rb-pct{{font-size:2.8rem;font-weight:900;color:#4ade80;
+             line-height:1;letter-spacing:-.02em}}
+    .rb-label{{color:#86efac;font-size:.78rem;font-weight:600;
+               text-transform:uppercase;letter-spacing:.06em;margin-top:.2rem}}
+    .rb-divider{{width:1px;background:#16a34a40;align-self:stretch}}
+    .rb-detail{{flex:1;display:flex;gap:2rem;flex-wrap:wrap}}
+    .rb-stat{{text-align:center}}
+    .rb-stat-val{{font-size:1.5rem;font-weight:800;color:var(--acc-lt)}}
+    .rb-stat-lbl{{font-size:.72rem;color:var(--dim);text-transform:uppercase;
+                  letter-spacing:.05em}}
+    .meta-strip{{display:flex;gap:1.5rem;flex-wrap:wrap;
+                 font-size:.78rem;color:var(--dim)}}
+    .meta-strip span{{display:flex;align-items:center;gap:.35rem}}
+    .meta-strip strong{{color:var(--text)}}
+    .main{{max-width:1100px;margin:0 auto;padding:2rem}}
+    .section-title{{font-size:1rem;font-weight:700;color:var(--acc-lt);
+      text-transform:uppercase;letter-spacing:.08em;margin-bottom:1rem;
+      padding-bottom:.4rem;border-bottom:1px solid var(--border)}}
+    .sev-table-wrap{{background:var(--surf);border:1px solid var(--border);
+                     border-radius:10px;overflow:hidden;margin-bottom:2.5rem}}
+    .sev-table{{width:100%;border-collapse:collapse;font-size:.88rem}}
+    .sev-table th{{text-align:left;padding:.65rem 1rem;font-size:.72rem;
+      text-transform:uppercase;letter-spacing:.06em;color:var(--dim);
+      background:var(--surf2);border-bottom:1px solid var(--border)}}
+    .sev-table td{{padding:.65rem 1rem;border-bottom:1px solid var(--border);vertical-align:middle}}
+    .sev-table tr:last-child td{{border-bottom:none}}
+    .sev-pill{{display:inline-block;padding:.15rem .7rem;border-radius:20px;
+               font-size:.72rem;font-weight:700;color:#fff;letter-spacing:.04em}}
+    .num{{font-weight:700;color:var(--text)}}
+    .rng{{color:#4ade80;font-weight:600;font-size:.85rem}}
+    .bar-track{{height:8px;background:var(--surf2);border-radius:4px;
+                overflow:hidden;min-width:120px}}
+    .bar-fill{{height:100%;border-radius:4px}}
+    .nav-wrap{{background:var(--surf);border:1px solid var(--border);
+               border-radius:10px;overflow:hidden;margin-bottom:2.5rem}}
+    .nav-row{{display:flex;align-items:center;gap:.8rem;padding:.6rem 1rem;
+              border-bottom:1px solid var(--border);text-decoration:none;
+              color:var(--text);font-size:.85rem;transition:background .15s}}
+    .nav-row:last-child{{border-bottom:none}}
+    .nav-row:hover{{background:var(--surf2)}}
+    .nav-num{{font-size:.72rem;color:var(--dim);width:28px;
+              text-align:right;flex-shrink:0}}
+    .nav-sev{{width:22px;height:22px;border-radius:50%;display:flex;
+              align-items:center;justify-content:center;font-size:.65rem;
+              font-weight:900;color:#fff;flex-shrink:0}}
+    .nav-id{{font-family:monospace;font-size:.8rem;color:var(--acc-lt);
+             flex-shrink:0;width:36px}}
+    .nav-name{{flex:1}}
+    .nav-loc{{font-family:monospace;font-size:.75rem;color:var(--dim);flex-shrink:0}}
+    .nav-cpu{{font-size:.75rem;color:#4ade80;font-weight:700;
+              flex-shrink:0;min-width:80px;text-align:right}}
+    .card{{background:var(--surf);border:1px solid var(--border);
+           border-radius:12px;overflow:hidden;margin-bottom:1.8rem}}
+    .card-head{{padding:1.2rem 1.5rem}}
+    .ch-top{{display:flex;align-items:center;gap:.7rem;flex-wrap:wrap;margin-bottom:.7rem}}
+    .ch-num{{font-size:.75rem;color:var(--dim);font-weight:600}}
+    .ch-sev{{padding:.2rem .75rem;border-radius:20px;font-size:.72rem;
+             font-weight:800;color:#fff;letter-spacing:.04em}}
+    .ch-id{{font-family:monospace;font-size:.85rem;color:var(--acc-lt);font-weight:700}}
+    .ch-name{{font-size:.95rem;font-weight:700;color:#fff;flex:1}}
+    .cpu-tag{{display:flex;align-items:center;gap:.3rem;background:#052e1650;
+              border:1px solid #16a34a40;border-radius:20px;padding:.2rem .8rem;
+              font-size:.75rem;font-weight:700;color:#4ade80}}
+    .ch-meta{{display:flex;flex-wrap:wrap;gap:.8rem;font-size:.78rem;
+              color:var(--dim);align-items:center}}
+    .ch-meta strong{{color:var(--text)}}
+    .verdict-chip{{display:inline-flex;align-items:center;gap:.3rem;padding:.2rem .75rem;
+                   border-radius:20px;font-size:.72rem;font-weight:700}}
+    .v-confirmed{{background:#052e16;color:#4ade80;border:1px solid #16a34a}}
+    .v-partial{{background:var(--amber-bg);color:#fbbf24;border:1px solid var(--amber)}}
+    .card-body{{padding:1.2rem 1.5rem}}
+    .section-block{{margin-bottom:1.2rem;padding:1rem 1.2rem;border-radius:8px;
+                    border:1px solid var(--border);background:var(--surf2)}}
+    .issue-block{{border-left:3px solid #ca8a04}}
+    .impl-block{{border-left:3px solid var(--accent)}}
+    .llm-block{{border-left:3px solid #4ade80}}
+    .block-title{{font-size:.78rem;font-weight:700;text-transform:uppercase;
+                  letter-spacing:.06em;color:var(--dim);margin-bottom:.5rem}}
+    .block-text{{font-size:.88rem;color:var(--text)}}
+    .code-duo{{display:grid;grid-template-columns:1fr 1fr;gap:1rem;margin-bottom:1.2rem}}
+    @media(max-width:700px){{.code-duo{{grid-template-columns:1fr}}}}
+    .code-panel{{border-radius:8px;overflow:hidden;border:1px solid var(--border)}}
+    .panel-label{{padding:.45rem .9rem;font-size:.75rem;font-weight:700;letter-spacing:.03em}}
+    .err-label{{background:#3b0a0a;color:#fca5a5}}
+    .ok-label{{background:#052e16;color:#86efac}}
+    .code-pre{{margin:0;padding:.9rem;background:#0a0a12;
+               font-family:"Cascadia Code","Consolas",monospace;font-size:.78rem;
+               color:#c4c4e0;overflow-x:auto;white-space:pre-wrap;word-break:break-word}}
+    .llm-box{{display:flex;gap:.8rem;align-items:flex-start;padding:.8rem 1rem;border-radius:6px;font-size:.85rem}}
+    .v-confirmed.llm-box{{background:#052e1650}}
+    .v-partial.llm-box{{background:#1c140050}}
+    .llm-verdict{{font-weight:800;font-size:.72rem;letter-spacing:.05em;flex-shrink:0;margin-top:.15rem}}
+    .v-confirmed .llm-verdict{{color:#4ade80}}
+    .v-partial .llm-verdict{{color:#fbbf24}}
+    .llm-text{{color:var(--text)}}
+    .evidence-details{{margin-top:.5rem}}
+    .ev-summary{{cursor:pointer;font-size:.78rem;color:var(--dim);padding:.4rem .2rem;user-select:none}}
+    .ev-summary:hover{{color:var(--acc-lt)}}
+    .ev-text{{margin-top:.6rem;font-size:.82rem;color:var(--dim);padding:.8rem 1rem;
+              background:var(--surf2);border-radius:6px;border:1px solid var(--border)}}
+    .footer{{text-align:center;padding:2rem;font-size:.75rem;color:var(--dim);
+             border-top:1px solid var(--border);margin-top:2rem}}
+    .footer strong{{color:var(--acc-lt)}}
+  </style>
+</head>
+<body>
+
+<!-- ═══════════════════════════════ HERO ═══════════════════════════ -->
+<div class="hero">
+  <div class="hero-inner">
+    <div class="hero-badge">✅ LLM-Validated · True Positives Only</div>
+    <h1>Developer Action Report</h1>
+    <p class="hero-sub">
+      Generated&nbsp;<strong>{now}</strong>&nbsp;·&nbsp;
+      Source:&nbsp;<strong>{files_str}</strong>&nbsp;·&nbsp;
+      <!-- FILL IN: <strong>N</strong>&nbsp;confirmed findings (X false positives removed) -->
+    </p>
+
+    <!-- CPU Reduction Banner -->
+    <div class="reduction-banner">
+      <div class="rb-main">
+        <!-- FILL IN: Replace X.X%–Y.Y% with sum of confirmed findings' CPU estimates -->
+        <div class="rb-pct">X.X%–Y.Y%</div>
+        <div class="rb-label">Estimated CPU Load Reduction</div>
+      </div>
+      <div class="rb-divider"></div>
+      <div class="rb-detail">
+        <div class="rb-stat">
+          <!-- FILL IN: count of confirmed findings -->
+          <div class="rb-stat-val">N</div>
+          <div class="rb-stat-lbl">Confirmed Findings</div>
+        </div>
+        <div class="rb-stat">
+          <div class="rb-stat-val">{total_findings}</div>
+          <div class="rb-stat-lbl">Raw Findings</div>
+        </div>
+        <div class="rb-stat">
+          <!-- FILL IN: total_findings minus confirmed count -->
+          <div class="rb-stat-val">N</div>
+          <div class="rb-stat-lbl">False Positives Removed</div>
+        </div>
+        <div class="rb-stat">
+          <!-- FILL IN: confirmed/total_findings * 100, rounded -->
+          <div class="rb-stat-val">N%</div>
+          <div class="rb-stat-lbl">Tool Precision</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="meta-strip">
+      <span>📅 <strong>{now}</strong></span>
+      <span>📁 <strong>{files_str}</strong></span>
+      <span>🔍 <strong>{total_findings}</strong> raw &nbsp;→&nbsp;
+            <!-- FILL IN: ✅ <strong>N</strong> confirmed --></span>
+    </div>
+  </div>
+</div>
+
+<!-- ════════════════════════════ MAIN CONTENT ══════════════════════ -->
+<div class="main">
+
+  <!-- Severity Summary Table -->
+  <div class="section-title">CPU Reduction by Severity</div>
+  <div class="sev-table-wrap">
+    <table class="sev-table">
+      <thead>
+        <tr>
+          <th>Severity</th><th>Findings</th>
+          <th>CPU Reduction Range</th><th style="min-width:150px">Weight</th>
+        </tr>
+      </thead>
+      <tbody>
+        <!--
+        FILL IN: One <tr> per severity that has confirmed findings.
+        Example row structure:
+        <tr>
+          <td><span class="sev-pill" style="background:#dc2626">CRITICAL</span></td>
+          <td class="num">3</td>
+          <td class="rng">1.4%&nbsp;–&nbsp;3.5%</td>
+          <td><div class="bar-track"><div class="bar-fill"
+              style="width:35%;background:#dc2626"></div></div></td>
+        </tr>
+        Bar width = min(max_pct * 5, 100).
+        -->
+      </tbody>
+    </table>
+  </div>
+
+  <!-- Priority Navigation -->
+  <div class="section-title">Implementation Priority Queue</div>
+  <div class="nav-wrap">
+    <!--
+    FILL IN: One <a class="nav-row"> per confirmed finding, sorted by impact desc.
+    Example:
+    <a href="#f1" class="nav-row">
+      <span class="nav-num">#1</span>
+      <span class="nav-sev" style="background:#dc2626">C</span>
+      <span class="nav-id">C02</span>
+      <span class="nav-name">Integer Division Without Power-of-2 Check</span>
+      <span class="nav-loc">sensor.c:145</span>
+      <span class="nav-cpu">▼0.32%–0.80%</span>
+    </a>
+    -->
+  </div>
+
+  <!-- Finding Cards -->
+  <div class="section-title">Detailed Findings — Fix These</div>
+
+  {sample_card}
+
+  <!--
+  FILL IN: Add one <div class="card"> per additional confirmed finding.
+  Copy the structure from the example card above.
+  Use id="f2", id="f3", etc. for subsequent cards.
+  Replace all <!-- FILL IN: --> comments with actual data.
+  Remove this comment block from your final output.
+  -->
+
+</div>
+
+<!-- ═══════════════════════════════ FOOTER ══════════════════════════ -->
+<div class="footer">
+  Generated by <strong>CPU Load Optimizer</strong> · LLM-Validated True Positives Only ·
+  <!-- FILL IN: N of {total_findings} findings confirmed --> · {now}
+</div>
+
+</body>
+</html>"""
+
+
+# ============================================================================
+# LLM RESPONSE PARSER — Extracts True Positives from LLM validation output
+# ============================================================================
+
+class LLMResponseParser:
+    """
+    Parses an LLM validation response (from Gemini/GPT) and correlates
+    CONFIRMED verdicts back to the original Finding objects.
+
+    Expected LLM response format (as instructed in validation_prompt.md):
+        [C01] Float Variables — Line 45
+        VERDICT: CONFIRMED
+        REASONING: ...
+
+    Returns only CONFIRMED and PARTIAL findings (True Positives),
+    enriched with the LLM's reasoning for each verdict.
+    """
+
+    VERDICT_CONFIRMED = "CONFIRMED"
+    VERDICT_FALSE_POSITIVE = "FALSE POSITIVE"
+    VERDICT_CONTEXT_NEEDED = "CONTEXT NEEDED"
+    VERDICT_PARTIAL = "PARTIAL"
+
+    @staticmethod
+    def parse(response_text: str,
+              all_findings: List[Finding]) -> List[Dict]:
+        """
+        Parse LLM response and return only true-positive results.
+
+        Args:
+            response_text: The full LLM response text.
+            all_findings:  Original findings list from the analyzer.
+
+        Returns:
+            List of dicts, each containing:
+                'finding'        – original Finding object
+                'verdict'        – 'CONFIRMED' or 'PARTIAL'
+                'reasoning'      – LLM's reasoning string
+                'revised_impact' – LLM-suggested impact (int or None)
+        """
+        blocks = LLMResponseParser._split_into_blocks(response_text)
+        results = []
+        used_findings: Set[int] = set()   # track by id() to avoid duplicates
+
+        for block in blocks:
+            parsed = LLMResponseParser._parse_block(block)
+            if parsed is None:
+                continue
+
+            rule_id, line_hint, verdict, reasoning, revised_impact = parsed
+
+            # Keep only true positives
+            if verdict not in (LLMResponseParser.VERDICT_CONFIRMED,
+                               LLMResponseParser.VERDICT_PARTIAL):
+                continue
+
+            finding = LLMResponseParser._match_finding(
+                rule_id, line_hint, all_findings, used_findings
+            )
+            if finding is None:
+                continue
+
+            used_findings.add(id(finding))
+            results.append({
+                'finding': finding,
+                'verdict': verdict,
+                'reasoning': reasoning,
+                'revised_impact': revised_impact,
+            })
+
+        # Sort by impact descending
+        results.sort(
+            key=lambda r: -(r['revised_impact'] or r['finding'].impact_score)
+        )
+        return results
+
+    @staticmethod
+    def _split_into_blocks(text: str) -> List[str]:
+        """Split the LLM response into per-finding blocks."""
+        positions = [m.start() for m in re.finditer(r'\[[A-Z]\d+\]', text)]
+        if not positions:
+            return []
+        blocks = []
+        for i, pos in enumerate(positions):
+            end = positions[i + 1] if i + 1 < len(positions) else len(text)
+            blocks.append(text[pos:end])
+        return blocks
+
+    @staticmethod
+    def _parse_block(block: str) -> Optional[Tuple]:
+        """
+        Parse a single LLM finding block.
+
+        Returns (rule_id, line_hint, verdict, reasoning, revised_impact)
+        or None if the block cannot be parsed.
+        """
+        rule_match = re.search(r'\[([A-Z]\d+)\]', block)
+        if not rule_match:
+            return None
+        rule_id = rule_match.group(1)
+
+        line_match = re.search(r'[Ll]ines?\s*(\d+)', block)
+        line_hint = int(line_match.group(1)) if line_match else None
+
+        verdict_match = re.search(
+            r'VERDICT\s*:\s*(CONFIRMED|FALSE POSITIVE|CONTEXT NEEDED|PARTIAL)',
+            block, re.IGNORECASE
+        )
+        if not verdict_match:
+            return None
+        verdict = verdict_match.group(1).strip().upper()
+
+        reasoning_match = re.search(
+            r'REASONING\s*:\s*(.+?)(?=\nREVISED IMPACT|\n\[[A-Z]\d+\]|\Z)',
+            block, re.DOTALL | re.IGNORECASE
+        )
+        reasoning = (reasoning_match.group(1).strip()
+                     if reasoning_match else "")
+
+        revised_match = re.search(
+            r'REVISED IMPACT\s*:\s*(\d+)', block, re.IGNORECASE
+        )
+        revised_impact = (int(revised_match.group(1))
+                          if revised_match else None)
+
+        return rule_id, line_hint, verdict, reasoning, revised_impact
+
+    @staticmethod
+    def _match_finding(rule_id: str,
+                       line_hint: Optional[int],
+                       findings: List[Finding],
+                       used_ids: Set[int]) -> Optional[Finding]:
+        """Find the best unused matching finding for a given rule + line."""
+        candidates = [
+            f for f in findings
+            if f.rule_id == rule_id and id(f) not in used_ids
+        ]
+        if not candidates:
+            return None
+        if len(candidates) == 1:
+            return candidates[0]
+
+        if line_hint is not None:
+            candidates.sort(key=lambda f: abs(f.line_number - line_hint))
+            return candidates[0]
+
+        candidates.sort(key=lambda f: -f.impact_score)
+        return candidates[0]
+
+    @staticmethod
+    def load_findings_cache(cache_path: str) -> Tuple[List[Finding], List[str]]:
+        """
+        Load a findings_cache.json (generated by LLMValidationExport).
+
+        Returns (findings_list, files_analyzed).
+        """
+        with open(cache_path, 'r', encoding='utf-8') as fh:
+            data = json.load(fh)
+
+        findings = []
+        for d in data.get('findings', []):
+            findings.append(Finding(
+                rule_id=d['rule_id'],
+                rule_name=d['rule_name'],
+                severity=Severity(d['severity']),
+                category=d['category'],
+                file_path=d['file_path'],
+                line_number=d['line_number'],
+                code_snippet=d['code_snippet'],
+                matched_text=d['matched_text'],
+                description=d['description'],
+                recommendation=d['recommendation'],
+                suggested_fix=d['suggested_fix'],
+                evidence=d['evidence'],
+                impact_score=d['impact_score'],
+            ))
+        return findings, data.get('files_analyzed', [])
+
+
+# ============================================================================
+# LLM VALIDATED REPORT — Developer-ready HTML for true-positive findings only
+# ============================================================================
+
+class LLMValidatedReportGenerator:
+    """
+    Generates a lean, developer-ready HTML action report that contains
+    ONLY LLM-confirmed True Positive findings.
+
+    Design principles:
+    - Zero noise: false positives are completely excluded.
+    - Sorted by impact: most impactful fix listed first.
+    - Actionable: every card shows before/after code + implementation steps.
+    - Quantified: each finding carries an estimated CPU load reduction range.
+    - Self-contained: single HTML file, no external dependencies.
+    """
+
+    @staticmethod
+    def generate(confirmed_results: List[Dict],
+                 files_analyzed: List[str],
+                 output_path: str,
+                 original_total: int = 0) -> str:
+        """
+        Generate the validated developer report.
+
+        Args:
+            confirmed_results: Output of LLMResponseParser.parse()
+            files_analyzed:    Paths to the analyzed source files
+            output_path:       Destination HTML file path
+            original_total:    Raw finding count before LLM filtering
+
+        Returns:
+            Absolute path to the generated HTML file.
+        """
+        findings = [r['finding'] for r in confirmed_results]
+        cpu_est = ReportGenerator.estimate_cpu_reduction(findings)
+
+        html_content = LLMValidatedReportGenerator._build_html(
+            confirmed_results, files_analyzed, cpu_est, original_total
+        )
+
+        out = Path(output_path)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        with open(str(out), 'w', encoding='utf-8') as fh:
+            fh.write(html_content)
+        return str(out)
+
+    # ── Private helpers ───────────────────────────────────────────────
+
+    @staticmethod
+    def _sev_color(sev_name: str) -> str:
+        return {
+            "CRITICAL": "#dc2626",
+            "HIGH":     "#ea580c",
+            "MEDIUM":   "#ca8a04",
+            "LOW":      "#2563eb",
+        }.get(sev_name, "#6b7280")
+
+    @staticmethod
+    def _sev_bg(sev_name: str) -> str:
+        return {
+            "CRITICAL": "#3b0a0a",
+            "HIGH":     "#2d1306",
+            "MEDIUM":   "#2b2000",
+            "LOW":      "#0a1a3b",
+        }.get(sev_name, "#1a1a2e")
+
+    @staticmethod
+    def _per_finding_cpu(rule_id: str) -> Tuple[float, float]:
+        base = ReportGenerator.REDUCTION_MAP.get(rule_id, 0.1)
+        return round(base * 0.4, 2), round(base, 2)
+
+    @staticmethod
+    def _build_html(confirmed_results, files_analyzed, cpu_est,
+                    original_total) -> str:
+        now = datetime.now().strftime('%Y-%m-%d %H:%M')
+        files_str = html.escape(
+            ', '.join(os.path.basename(f) for f in files_analyzed)
+            or 'N/A'
+        )
+        total_confirmed = len(confirmed_results)
+        total_min = cpu_est['TOTAL']['min_pct']
+        total_max = cpu_est['TOTAL']['max_pct']
+        fp_removed = original_total - total_confirmed
+
+        # ── Severity Summary Table Rows ──────────────────────────────
+        sev_rows = ""
+        for sev in ["CRITICAL", "HIGH", "MEDIUM", "LOW"]:
+            d = cpu_est.get(sev, {})
+            cnt = d.get('count', 0)
+            if cnt == 0:
+                continue
+            clr = LLMValidatedReportGenerator._sev_color(sev)
+            mn, mx = d.get('min_pct', 0), d.get('max_pct', 0)
+            bar_w = min(int(mx * 5), 100)
+            sev_rows += f"""
+                <tr>
+                  <td><span class="sev-pill" style="background:{clr}">{sev}</span></td>
+                  <td class="num">{cnt}</td>
+                  <td class="rng">{mn}%&nbsp;–&nbsp;{mx}%</td>
+                  <td><div class="bar-track"><div class="bar-fill"
+                      style="width:{bar_w}%;background:{clr}"></div></div></td>
+                </tr>"""
+
+        # ── Priority Navigation ──────────────────────────────────────
+        nav_items = ""
+        for idx, r in enumerate(confirmed_results, 1):
+            f = r['finding']
+            clr = LLMValidatedReportGenerator._sev_color(f.severity_name)
+            mn, mx = LLMValidatedReportGenerator._per_finding_cpu(f.rule_id)
+            nav_items += f"""
+              <a href="#f{idx}" class="nav-row">
+                <span class="nav-num">#{idx}</span>
+                <span class="nav-sev" style="background:{clr}">{f.severity_name[0]}</span>
+                <span class="nav-id">{html.escape(f.rule_id)}</span>
+                <span class="nav-name">{html.escape(f.rule_name)}</span>
+                <span class="nav-loc">{html.escape(os.path.basename(f.file_path))}:{f.line_number}</span>
+                <span class="nav-cpu">▼{mn}–{mx}%</span>
+              </a>"""
+
+        # ── Finding Cards ────────────────────────────────────────────
+        cards = ""
+        for idx, r in enumerate(confirmed_results, 1):
+            f = r['finding']
+            verdict = r['verdict']
+            reasoning = html.escape(r['reasoning'] or '(no reasoning provided)')
+            impact = r['revised_impact'] or f.impact_score
+            clr = LLMValidatedReportGenerator._sev_color(f.severity_name)
+            bg = LLMValidatedReportGenerator._sev_bg(f.severity_name)
+            mn, mx = LLMValidatedReportGenerator._per_finding_cpu(f.rule_id)
+
+            v_class = "v-confirmed" if verdict == "CONFIRMED" else "v-partial"
+            v_icon = "✅" if verdict == "CONFIRMED" else "⚠️"
+
+            snippet = html.escape(f.code_snippet or '(no snippet available)')
+            fix = html.escape(f.suggested_fix or '(see recommendation below)')
+            desc = html.escape(f.description)
+            rec = html.escape(f.recommendation)
+            ev = html.escape(f.evidence)
+
+            cards += f"""
+        <div class="card" id="f{idx}">
+          <!-- Card Header -->
+          <div class="card-head" style="background:{bg};border-left:5px solid {clr}">
+            <div class="ch-top">
+              <span class="ch-num">#{idx}</span>
+              <span class="ch-sev" style="background:{clr}">{f.severity_name}</span>
+              <span class="ch-id">{html.escape(f.rule_id)}</span>
+              <span class="ch-name">{html.escape(f.rule_name)}</span>
+              <div class="cpu-tag">
+                <span>⚡</span>
+                <span>▼&nbsp;{mn}%&nbsp;–&nbsp;{mx}%&nbsp;CPU</span>
+              </div>
+            </div>
+            <div class="ch-meta">
+              <span>📁&nbsp;<strong>{html.escape(os.path.basename(f.file_path))}</strong>&nbsp;:&nbsp;Line&nbsp;{f.line_number}</span>
+              <span>📊&nbsp;Impact&nbsp;<strong>{impact}/100</strong></span>
+              <span>🏷&nbsp;{html.escape(f.category)}</span>
+              <span class="verdict-chip {v_class}">{v_icon}&nbsp;{html.escape(verdict)}</span>
+            </div>
+          </div>
+
+          <!-- Card Body -->
+          <div class="card-body">
+
+            <!-- Issue description -->
+            <div class="section-block issue-block">
+              <div class="block-title">⚠&nbsp;Issue</div>
+              <p class="block-text">{desc}</p>
+            </div>
+
+            <!-- Before / After Code -->
+            <div class="code-duo">
+              <div class="code-panel before-panel">
+                <div class="panel-label err-label">❌&nbsp;Problematic Code&nbsp;—&nbsp;Line {f.line_number}</div>
+                <pre class="code-pre"><code>{snippet}</code></pre>
+              </div>
+              <div class="code-panel after-panel">
+                <div class="panel-label ok-label">✅&nbsp;Suggested Fix</div>
+                <pre class="code-pre"><code>{fix}</code></pre>
+              </div>
+            </div>
+
+            <!-- Implementation Guidance -->
+            <div class="section-block impl-block">
+              <div class="block-title">📋&nbsp;Implementation Steps</div>
+              <p class="block-text">{rec}</p>
+            </div>
+
+            <!-- LLM Reasoning -->
+            <div class="section-block llm-block">
+              <div class="block-title">🤖&nbsp;LLM Verification Reasoning</div>
+              <div class="llm-box {v_class}">
+                <span class="llm-verdict">{html.escape(verdict)}</span>
+                <span class="llm-text">{reasoning}</span>
+              </div>
+            </div>
+
+            <!-- Technical Evidence (collapsed) -->
+            <details class="evidence-details">
+              <summary class="ev-summary">📚&nbsp;Technical Evidence &amp; References</summary>
+              <p class="ev-text">{ev}</p>
+            </details>
+
+          </div>
+        </div>"""
+
+        # ── Assemble Full HTML ───────────────────────────────────────
+        return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>CPU Optimizer — Developer Action Report</title>
+  <style>
+    :root {{
+      --bg:       #0f0f17;
+      --surf:     #1a1a2e;
+      --surf2:    #222240;
+      --border:   #2d2d4a;
+      --text:     #e2e2f0;
+      --dim:      #8888a8;
+      --accent:   #6c5ce7;
+      --acc-lt:   #a78bfa;
+      --green:    #16a34a;
+      --green-bg: #052e16;
+      --amber:    #ca8a04;
+      --amber-bg: #1c1400;
+    }}
+    *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
+    html {{ scroll-behavior: smooth; }}
+    body {{
+      font-family: "Segoe UI", system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      line-height: 1.6;
+    }}
+
+    /* ── Hero ──────────────────────────────────────────────────────── */
+    .hero {{
+      background: linear-gradient(135deg, #1a1a40 0%, #0f0f17 60%);
+      border-bottom: 1px solid var(--border);
+      padding: 2.5rem 2rem 2rem;
+    }}
+    .hero-inner {{ max-width: 1100px; margin: 0 auto; }}
+    .hero-badge {{
+      display: inline-block;
+      background: var(--green-bg);
+      color: #4ade80;
+      border: 1px solid #16a34a;
+      border-radius: 20px;
+      font-size: .75rem;
+      font-weight: 700;
+      letter-spacing: .08em;
+      padding: .25rem .9rem;
+      margin-bottom: 1rem;
+      text-transform: uppercase;
+    }}
+    .hero h1 {{
+      font-size: 1.9rem;
+      font-weight: 800;
+      color: #fff;
+      margin-bottom: .35rem;
+    }}
+    .hero-sub {{
+      color: var(--dim);
+      font-size: .9rem;
+      margin-bottom: 1.8rem;
+    }}
+    .hero-sub strong {{ color: var(--acc-lt); }}
+
+    /* CPU Reduction Banner */
+    .reduction-banner {{
+      display: flex;
+      align-items: center;
+      gap: 2rem;
+      background: linear-gradient(90deg,#14532d20,#052e1640);
+      border: 1px solid #16a34a50;
+      border-radius: 12px;
+      padding: 1.2rem 1.8rem;
+      margin-bottom: 1.8rem;
+    }}
+    .rb-main {{
+      flex: 0 0 auto;
+      text-align: center;
+    }}
+    .rb-pct {{
+      font-size: 2.8rem;
+      font-weight: 900;
+      color: #4ade80;
+      line-height: 1;
+      letter-spacing: -.02em;
+    }}
+    .rb-label {{
+      color: #86efac;
+      font-size: .78rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: .06em;
+      margin-top: .2rem;
+    }}
+    .rb-divider {{ width: 1px; background: #16a34a40; align-self: stretch; }}
+    .rb-detail {{ flex: 1; display: flex; gap: 2rem; flex-wrap: wrap; }}
+    .rb-stat {{ text-align: center; }}
+    .rb-stat-val {{
+      font-size: 1.5rem;
+      font-weight: 800;
+      color: var(--acc-lt);
+    }}
+    .rb-stat-lbl {{
+      font-size: .72rem;
+      color: var(--dim);
+      text-transform: uppercase;
+      letter-spacing: .05em;
+    }}
+
+    /* Meta row */
+    .meta-strip {{
+      display: flex;
+      gap: 1.5rem;
+      flex-wrap: wrap;
+      font-size: .78rem;
+      color: var(--dim);
+    }}
+    .meta-strip span {{ display: flex; align-items: center; gap: .35rem; }}
+    .meta-strip strong {{ color: var(--text); }}
+
+    /* ── Layout ─────────────────────────────────────────────────── */
+    .main {{ max-width: 1100px; margin: 0 auto; padding: 2rem; }}
+
+    /* ── Section headings ───────────────────────────────────────── */
+    .section-title {{
+      font-size: 1rem;
+      font-weight: 700;
+      color: var(--acc-lt);
+      text-transform: uppercase;
+      letter-spacing: .08em;
+      margin-bottom: 1rem;
+      padding-bottom: .4rem;
+      border-bottom: 1px solid var(--border);
+    }}
+
+    /* ── Severity Summary ───────────────────────────────────────── */
+    .sev-table-wrap {{
+      background: var(--surf);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      overflow: hidden;
+      margin-bottom: 2.5rem;
+    }}
+    .sev-table {{
+      width: 100%;
+      border-collapse: collapse;
+      font-size: .88rem;
+    }}
+    .sev-table th {{
+      text-align: left;
+      padding: .65rem 1rem;
+      font-size: .72rem;
+      text-transform: uppercase;
+      letter-spacing: .06em;
+      color: var(--dim);
+      background: var(--surf2);
+      border-bottom: 1px solid var(--border);
+    }}
+    .sev-table td {{
+      padding: .65rem 1rem;
+      border-bottom: 1px solid var(--border);
+      vertical-align: middle;
+    }}
+    .sev-table tr:last-child td {{ border-bottom: none; }}
+    .sev-pill {{
+      display: inline-block;
+      padding: .15rem .7rem;
+      border-radius: 20px;
+      font-size: .72rem;
+      font-weight: 700;
+      color: #fff;
+      letter-spacing: .04em;
+    }}
+    .num {{ font-weight: 700; color: var(--text); }}
+    .rng {{ color: #4ade80; font-weight: 600; font-size: .85rem; }}
+    .bar-track {{
+      height: 8px;
+      background: var(--surf2);
+      border-radius: 4px;
+      overflow: hidden;
+      min-width: 120px;
+    }}
+    .bar-fill {{ height: 100%; border-radius: 4px; transition: width .3s; }}
+
+    /* ── Priority Navigation ────────────────────────────────────── */
+    .nav-wrap {{
+      background: var(--surf);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      overflow: hidden;
+      margin-bottom: 2.5rem;
+    }}
+    .nav-row {{
+      display: flex;
+      align-items: center;
+      gap: .8rem;
+      padding: .6rem 1rem;
+      border-bottom: 1px solid var(--border);
+      text-decoration: none;
+      color: var(--text);
+      font-size: .85rem;
+      transition: background .15s;
+    }}
+    .nav-row:last-child {{ border-bottom: none; }}
+    .nav-row:hover {{ background: var(--surf2); }}
+    .nav-num {{
+      font-size: .72rem;
+      color: var(--dim);
+      width: 28px;
+      text-align: right;
+      flex-shrink: 0;
+    }}
+    .nav-sev {{
+      width: 22px;
+      height: 22px;
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: .65rem;
+      font-weight: 900;
+      color: #fff;
+      flex-shrink: 0;
+    }}
+    .nav-id {{
+      font-family: monospace;
+      font-size: .8rem;
+      color: var(--acc-lt);
+      flex-shrink: 0;
+      width: 36px;
+    }}
+    .nav-name {{ flex: 1; }}
+    .nav-loc {{
+      font-family: monospace;
+      font-size: .75rem;
+      color: var(--dim);
+      flex-shrink: 0;
+    }}
+    .nav-cpu {{
+      font-size: .75rem;
+      color: #4ade80;
+      font-weight: 700;
+      flex-shrink: 0;
+      min-width: 80px;
+      text-align: right;
+    }}
+
+    /* ── Finding Cards ──────────────────────────────────────────── */
+    .card {{
+      background: var(--surf);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      overflow: hidden;
+      margin-bottom: 1.8rem;
+    }}
+
+    /* Card Header */
+    .card-head {{ padding: 1.2rem 1.5rem; }}
+    .ch-top {{
+      display: flex;
+      align-items: center;
+      gap: .7rem;
+      flex-wrap: wrap;
+      margin-bottom: .7rem;
+    }}
+    .ch-num {{
+      font-size: .75rem;
+      color: var(--dim);
+      font-weight: 600;
+    }}
+    .ch-sev {{
+      padding: .2rem .75rem;
+      border-radius: 20px;
+      font-size: .72rem;
+      font-weight: 800;
+      color: #fff;
+      letter-spacing: .04em;
+    }}
+    .ch-id {{
+      font-family: monospace;
+      font-size: .85rem;
+      color: var(--acc-lt);
+      font-weight: 700;
+    }}
+    .ch-name {{
+      font-size: .95rem;
+      font-weight: 700;
+      color: #fff;
+      flex: 1;
+    }}
+    .cpu-tag {{
+      display: flex;
+      align-items: center;
+      gap: .3rem;
+      background: #052e1650;
+      border: 1px solid #16a34a40;
+      border-radius: 20px;
+      padding: .2rem .8rem;
+      font-size: .75rem;
+      font-weight: 700;
+      color: #4ade80;
+    }}
+    .ch-meta {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: .8rem;
+      font-size: .78rem;
+      color: var(--dim);
+      align-items: center;
+    }}
+    .ch-meta strong {{ color: var(--text); }}
+    .verdict-chip {{
+      display: inline-flex;
+      align-items: center;
+      gap: .3rem;
+      padding: .2rem .75rem;
+      border-radius: 20px;
+      font-size: .72rem;
+      font-weight: 700;
+    }}
+    .v-confirmed {{
+      background: #052e16;
+      color: #4ade80;
+      border: 1px solid #16a34a;
+    }}
+    .v-partial {{
+      background: var(--amber-bg);
+      color: #fbbf24;
+      border: 1px solid var(--amber);
+    }}
+
+    /* Card Body */
+    .card-body {{ padding: 1.2rem 1.5rem; }}
+    .section-block {{
+      margin-bottom: 1.2rem;
+      padding: 1rem 1.2rem;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: var(--surf2);
+    }}
+    .issue-block {{ border-left: 3px solid #ca8a04; }}
+    .impl-block  {{ border-left: 3px solid var(--accent); }}
+    .llm-block   {{ border-left: 3px solid #4ade80; }}
+    .block-title {{
+      font-size: .78rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: .06em;
+      color: var(--dim);
+      margin-bottom: .5rem;
+    }}
+    .block-text {{ font-size: .88rem; color: var(--text); }}
+
+    /* Code Before/After */
+    .code-duo {{
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1rem;
+      margin-bottom: 1.2rem;
+    }}
+    @media (max-width: 700px) {{
+      .code-duo {{ grid-template-columns: 1fr; }}
+    }}
+    .code-panel {{
+      border-radius: 8px;
+      overflow: hidden;
+      border: 1px solid var(--border);
+    }}
+    .panel-label {{
+      padding: .45rem .9rem;
+      font-size: .75rem;
+      font-weight: 700;
+      letter-spacing: .03em;
+    }}
+    .err-label {{ background: #3b0a0a; color: #fca5a5; }}
+    .ok-label  {{ background: #052e16; color: #86efac; }}
+    .code-pre {{
+      margin: 0;
+      padding: .9rem;
+      background: #0a0a12;
+      font-family: "Cascadia Code", "Consolas", monospace;
+      font-size: .78rem;
+      color: #c4c4e0;
+      overflow-x: auto;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }}
+
+    /* LLM box */
+    .llm-box {{
+      display: flex;
+      gap: .8rem;
+      align-items: flex-start;
+      padding: .8rem 1rem;
+      border-radius: 6px;
+      font-size: .85rem;
+    }}
+    .v-confirmed.llm-box {{ background: #052e1650; }}
+    .v-partial.llm-box   {{ background: #1c140050; }}
+    .llm-verdict {{
+      font-weight: 800;
+      font-size: .72rem;
+      letter-spacing: .05em;
+      flex-shrink: 0;
+      margin-top: .15rem;
+    }}
+    .v-confirmed .llm-verdict {{ color: #4ade80; }}
+    .v-partial   .llm-verdict {{ color: #fbbf24; }}
+    .llm-text {{ color: var(--text); }}
+
+    /* Evidence */
+    .evidence-details {{ margin-top: .5rem; }}
+    .ev-summary {{
+      cursor: pointer;
+      font-size: .78rem;
+      color: var(--dim);
+      padding: .4rem .2rem;
+      user-select: none;
+    }}
+    .ev-summary:hover {{ color: var(--acc-lt); }}
+    .ev-text {{
+      margin-top: .6rem;
+      font-size: .82rem;
+      color: var(--dim);
+      padding: .8rem 1rem;
+      background: var(--surf2);
+      border-radius: 6px;
+      border: 1px solid var(--border);
+    }}
+
+    /* ── Footer ─────────────────────────────────────────────────── */
+    .footer {{
+      text-align: center;
+      padding: 2rem;
+      font-size: .75rem;
+      color: var(--dim);
+      border-top: 1px solid var(--border);
+      margin-top: 2rem;
+    }}
+    .footer strong {{ color: var(--acc-lt); }}
+  </style>
+</head>
+<body>
+
+<!-- ═══════════════════════════════ HERO ═══════════════════════════════ -->
+<div class="hero">
+  <div class="hero-inner">
+    <div class="hero-badge">✅ LLM-Validated · True Positives Only</div>
+    <h1>Developer Action Report</h1>
+    <p class="hero-sub">
+      Generated&nbsp;<strong>{now}</strong>&nbsp;·&nbsp;
+      Source:&nbsp;<strong>{files_str}</strong>&nbsp;·&nbsp;
+      <strong>{total_confirmed}</strong>&nbsp;confirmed findings
+      ({fp_removed} false positives removed)
+    </p>
+
+    <!-- CPU Reduction Banner -->
+    <div class="reduction-banner">
+      <div class="rb-main">
+        <div class="rb-pct">{total_min}%–{total_max}%</div>
+        <div class="rb-label">Estimated CPU Load Reduction</div>
+      </div>
+      <div class="rb-divider"></div>
+      <div class="rb-detail">
+        <div class="rb-stat">
+          <div class="rb-stat-val">{total_confirmed}</div>
+          <div class="rb-stat-lbl">Confirmed Findings</div>
+        </div>
+        <div class="rb-stat">
+          <div class="rb-stat-val">{original_total}</div>
+          <div class="rb-stat-lbl">Raw Findings</div>
+        </div>
+        <div class="rb-stat">
+          <div class="rb-stat-val">{fp_removed}</div>
+          <div class="rb-stat-lbl">False Positives Removed</div>
+        </div>
+        <div class="rb-stat">
+          <div class="rb-stat-val">{round((total_confirmed/original_total*100) if original_total else 0)}%</div>
+          <div class="rb-stat-lbl">Tool Precision</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="meta-strip">
+      <span>📅 <strong>{now}</strong></span>
+      <span>📁 <strong>{files_str}</strong></span>
+      <span>🔍 <strong>{original_total}</strong> raw &nbsp;→&nbsp;
+            ✅ <strong>{total_confirmed}</strong> confirmed</span>
+    </div>
+  </div>
+</div>
+
+<!-- ════════════════════════════ MAIN CONTENT ══════════════════════════ -->
+<div class="main">
+
+  <!-- Severity Summary -->
+  <div class="section-title">CPU Reduction by Severity</div>
+  <div class="sev-table-wrap">
+    <table class="sev-table">
+      <thead>
+        <tr>
+          <th>Severity</th>
+          <th>Findings</th>
+          <th>CPU Reduction Range</th>
+          <th style="min-width:150px">Relative Weight</th>
+        </tr>
+      </thead>
+      <tbody>
+        {sev_rows}
+      </tbody>
+    </table>
+  </div>
+
+  <!-- Implementation Priority -->
+  <div class="section-title">Implementation Priority Queue</div>
+  <div class="nav-wrap">
+    {nav_items}
+  </div>
+
+  <!-- Finding Cards -->
+  <div class="section-title">Detailed Findings — Fix These</div>
+  {cards}
+
+</div>
+
+<!-- ═══════════════════════════════ FOOTER ═══════════════════════════ -->
+<div class="footer">
+  Generated by <strong>CPU Load Optimizer</strong> ·
+  LLM-validated True Positives only ·
+  {total_confirmed} of {original_total} findings confirmed ·
+  {now}
+</div>
+
+</body>
+</html>"""
 
 
 # ============================================================================
@@ -2921,9 +4325,18 @@ def run_analysis(files: List[str],
     log(f"  Total findings: {len(all_findings)}")
     log(f"  Report saved to: {report_path}")
     if llm_export_paths:
-        log(f"  LLM validation export:")
+        log(f"  LLM validation export (5 files):")
         for p in llm_export_paths:
             log(f"    → {p}")
+        log(f"")
+        log(f"  ── Next Step: Generate Developer Action Report ──────────")
+        log(f"  1. Open Gemini / GPT-4o with file upload")
+        log(f"  2. Upload: source files + findings_for_review.md "
+            f"+ report_template.html")
+        log(f"  3. Paste validation_prompt.md as your message")
+        log(f"  4. Save the LLM response as: validated_action_report.html")
+        log(f"  5. Open in browser → hand to developer — done!")
+        log(f"  (See HOW_TO_VALIDATE.md for full instructions)")
     log(f"{'='*60}\n")
 
     return {
@@ -3590,9 +5003,35 @@ def launch_gui():
                 )
 
                 if result.get('llm_export_paths'):
-                    self._log("  LLM Export:", "accent")
+                    self._log("  LLM Export (5 files):", "accent")
                     for p in result['llm_export_paths']:
                         self._log(f"    → {p}", "info")
+                    self._log("", "info")
+                    self._log(
+                        "  ── How to get your Developer Report ──",
+                        "accent"
+                    )
+                    self._log(
+                        "  1. Upload: source + findings_for_review.md"
+                        " + report_template.html to Gemini/GPT",
+                        "info"
+                    )
+                    self._log(
+                        "  2. Paste validation_prompt.md as your message",
+                        "info"
+                    )
+                    self._log(
+                        "  3. Save LLM response → validated_action_report.html",
+                        "info"
+                    )
+                    self._log(
+                        "  4. Open in browser → ready for developer!",
+                        "success"
+                    )
+                    self._log(
+                        "  (See HOW_TO_VALIDATE.md for full details)",
+                        "info"
+                    )
 
                 # Offer to open report
                 if messagebox.askyesno(
