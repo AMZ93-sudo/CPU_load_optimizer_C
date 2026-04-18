@@ -2395,7 +2395,20 @@ class LLMValidationExport:
         with open(instructions_path, 'w', encoding='utf-8') as f:
             f.write(instructions)
 
-        # ── File 5: Findings JSON Cache (for validated report generation) ──
+        # ── File 5: Automated LLM Prompt (for VS Code + Gemini flow) ──
+        # Self-contained prompt that embeds findings_for_review.md and
+        # forces a TRUE/FALSE POSITIVE classification against the
+        # source file the tool already has open in the editor.
+        auto_prompt_text = LLMValidationExport._build_automated_llm_prompt(
+            findings_text, files_analyzed
+        )
+        auto_prompt_path = os.path.join(
+            output_dir, "automated_llm_prompt.md"
+        )
+        with open(auto_prompt_path, 'w', encoding='utf-8') as f:
+            f.write(auto_prompt_text)
+
+        # ── File 6: Findings JSON Cache (for validated report generation) ──
         cache_path = os.path.join(output_dir, "findings_cache.json")
         cache_data = {
             "generated": datetime.now().strftime('%Y-%m-%d %H:%M'),
@@ -2423,7 +2436,8 @@ class LLMValidationExport:
         with open(cache_path, 'w', encoding='utf-8') as f:
             json.dump(cache_data, f, indent=2)
 
-        return findings_path, prompt_path, template_path, instructions_path, cache_path
+        return (findings_path, prompt_path, template_path,
+                instructions_path, auto_prompt_path, cache_path)
 
     @staticmethod
     def _build_findings_export(findings: List[Finding],
@@ -2525,6 +2539,139 @@ class LLMValidationExport:
                 lines.append("")
 
         return '\n'.join(lines)
+
+    @staticmethod
+    def _build_automated_llm_prompt(findings_markdown: str,
+                                    files_analyzed: List[str]) -> str:
+        """Self-contained prompt for the Automated LLM flow.
+
+        Unlike the generic validation_prompt.md (which asks the LLM to
+        emit a full HTML report), this prompt is narrowly scoped to
+        validate the specific findings the tool produced against the
+        source file already open in the VS Code editor, and to reply
+        with a concise True-Positive / False-Positive classification
+        for each finding — nothing else.
+
+        The findings_for_review.md content is embedded inline so the
+        chat message is 100% self-contained and doesn't require any
+        attachment upload.
+        """
+        file_list = ", ".join(
+            os.path.basename(f) for f in files_analyzed
+        ) or "(none)"
+
+        parts = []
+        parts.append(
+            "# ROLE: Senior Embedded C Code Reviewer — "
+            "Validation-Only Task"
+        )
+        parts.append("")
+        parts.append(
+            "You are acting as a strict validator for a static-"
+            "analysis tool. The tool has scanned an embedded C "
+            "source file and produced the findings listed at the "
+            "end of this message. The exact source file that "
+            "produced these findings is **already open in the "
+            "current VS Code editor** and has been added to your "
+            "context via the Gemini Code Assist extension."
+        )
+        parts.append("")
+        parts.append(f"**Files under review:** {file_list}")
+        parts.append("")
+        parts.append("---")
+        parts.append("")
+        parts.append("## YOUR TASK (do ONLY this, nothing else)")
+        parts.append("")
+        parts.append(
+            "1. Read the source code that is open in the editor."
+        )
+        parts.append(
+            "2. For EACH finding listed in the "
+            "`# Findings For Review` section below, verify the "
+            "finding against the actual code at the stated file "
+            "and line number."
+        )
+        parts.append(
+            "3. Classify each finding as exactly one of:"
+        )
+        parts.append("   - **TRUE POSITIVE** — the finding is "
+                     "real and the flagged code truly exhibits "
+                     "the reported issue.")
+        parts.append("   - **FALSE POSITIVE** — the finding is "
+                     "incorrect; the flagged code does NOT "
+                     "exhibit the reported issue when read in "
+                     "context.")
+        parts.append(
+            "4. Provide a detailed, verified explanation for "
+            "EVERY classification — cite the exact line(s) from "
+            "the source file you inspected, quote the relevant "
+            "code, and explain why the rule does or does not "
+            "apply in this specific context. Do NOT speculate; "
+            "base every judgment on the code you can actually "
+            "see in the editor."
+        )
+        parts.append("")
+        parts.append("## STRICT SCOPE RULES")
+        parts.append("")
+        parts.append(
+            "- Validate ONLY the findings listed below. Do NOT "
+            "introduce new findings, suggestions, refactors, or "
+            "style comments."
+        )
+        parts.append(
+            "- Do NOT produce HTML, tables of contents, code "
+            "rewrites, or executive summaries beyond what is "
+            "required by the output format below."
+        )
+        parts.append(
+            "- If the source in the editor does not match the "
+            "line number referenced by a finding (e.g. file was "
+            "edited since analysis), say so explicitly in the "
+            "explanation and classify based on what you see."
+        )
+        parts.append("")
+        parts.append("## REQUIRED OUTPUT FORMAT (Markdown)")
+        parts.append("")
+        parts.append("Reply with exactly the following structure:")
+        parts.append("")
+        parts.append("```")
+        parts.append("## Validation Summary")
+        parts.append("- Total findings reviewed: <N>")
+        parts.append("- True Positives:  <count>")
+        parts.append("- False Positives: <count>")
+        parts.append("")
+        parts.append("## Per-Finding Verdict")
+        parts.append("")
+        parts.append("### Finding #<index> — <rule_id> — <rule_name>")
+        parts.append("- **File / Line:** <file>:<line>")
+        parts.append("- **Classification:** TRUE POSITIVE | "
+                     "FALSE POSITIVE")
+        parts.append("- **Evidence from source (quoted):**")
+        parts.append("  ```c")
+        parts.append("  <exact code lines you inspected>")
+        parts.append("  ```")
+        parts.append("- **Detailed verified explanation:**")
+        parts.append("  <multi-sentence justification grounded in "
+                     "the quoted code; explain precisely why the "
+                     "rule applies or does not apply here>")
+        parts.append("")
+        parts.append("(repeat for every finding)")
+        parts.append("```")
+        parts.append("")
+        parts.append("---")
+        parts.append("")
+        parts.append("# Findings For Review")
+        parts.append("")
+        parts.append(
+            "The block below is the exact content of "
+            "`findings_for_review.md` produced by the tool. "
+            "Treat it as the authoritative list of findings "
+            "you must validate."
+        )
+        parts.append("")
+        parts.append(findings_markdown)
+
+        return "\n".join(parts)
 
     @staticmethod
     def _build_validation_prompt(findings: List[Finding],
@@ -4325,7 +4472,7 @@ def run_analysis(files: List[str],
     log(f"  Total findings: {len(all_findings)}")
     log(f"  Report saved to: {report_path}")
     if llm_export_paths:
-        log(f"  LLM validation export (5 files):")
+        log(f"  LLM validation export ({len(llm_export_paths)} files):")
         for p in llm_export_paths:
             log(f"    → {p}")
         log(f"")
@@ -4405,8 +4552,12 @@ def launch_gui():
             self.repo_path = tk.StringVar()
             self.severity = tk.StringVar(value="low")
             self.llm_export = tk.BooleanVar(value=True)
+            self.auto_llm = tk.BooleanVar(value=True)
             self.annotate = tk.BooleanVar(value=False)
             self.is_running = False
+            # Source file passed to Automated LLM (single-file target for
+            # VS Code). Set by _run_file_analysis / _run_staged_analysis.
+            self.selected_source_file = None
 
             self._build_ui()
 
@@ -4623,6 +4774,18 @@ def launch_gui():
                 text="Generate LLM Validation Export "
                      "(for Gemini / GPT review)",
                 variable=self.llm_export,
+                font=("Segoe UI", 10),
+                fg=self.TEXT, bg=self.SURFACE,
+                selectcolor=self.SURFACE2,
+                activebackground=self.SURFACE,
+                activeforeground=self.TEXT
+            ).pack(anchor=tk.W)
+
+            tk.Checkbutton(
+                settings_row2,
+                text="Automated LLM Verification "
+                     "(VS Code + Gemini Code Assist, fully automatic)",
+                variable=self.auto_llm,
                 font=("Segoe UI", 10),
                 fg=self.TEXT, bg=self.SURFACE,
                 selectcolor=self.SURFACE2,
@@ -4873,6 +5036,14 @@ def launch_gui():
                 )
                 return
 
+            # Remember which source file to open in VS Code for Automated LLM.
+            # If user picked a single file, use it; if they picked a folder,
+            # use the first discovered source as the representative target.
+            if os.path.isfile(target):
+                self.selected_source_file = target
+            else:
+                self.selected_source_file = files[0]
+
             # Resolve output path
             script_dir = Path(os.path.dirname(os.path.abspath(__file__)))
             output_dir = script_dir / "Output"
@@ -4926,6 +5097,11 @@ def launch_gui():
             for fp in staged_files:
                 lines = GitAnalyzer.get_staged_line_numbers(repo, fp)
                 staged_lines[fp] = lines
+
+            # Remember first staged file as the target to open in VS Code
+            # when Automated LLM Verification runs after analysis.
+            first_staged_abs = os.path.join(repo, staged_files[0])
+            self.selected_source_file = first_staged_abs
 
             # Output path
             script_dir = Path(os.path.dirname(os.path.abspath(__file__)))
@@ -5003,7 +5179,10 @@ def launch_gui():
                 )
 
                 if result.get('llm_export_paths'):
-                    self._log("  LLM Export (5 files):", "accent")
+                    count = len(result['llm_export_paths'])
+                    self._log(
+                        f"  LLM Export ({count} files):", "accent"
+                    )
                     for p in result['llm_export_paths']:
                         self._log(f"    → {p}", "info")
                     self._log("", "info")
@@ -5033,14 +5212,41 @@ def launch_gui():
                         "info"
                     )
 
-                # Offer to open report
-                if messagebox.askyesno(
-                    "Analysis Complete",
-                    f"Found {total} optimization "
-                    f"opportunities.\n\n"
-                    f"Open the HTML report now?"
-                ):
+                # Post-analysis popup: choose between opening the HTML
+                # report and launching fully-automated LLM verification in
+                # VS Code via the Gemini Code Assist extension.
+                llm_paths = result.get('llm_export_paths') or []
+                llm_dir = None
+                if llm_paths:
+                    llm_dir = os.path.dirname(os.path.abspath(llm_paths[0]))
+
+                choice = self._show_completion_dialog(
+                    total_findings=total,
+                    report_path=result['report_path'],
+                    llm_available=bool(
+                        llm_dir and self.auto_llm.get()
+                    ),
+                )
+
+                if choice == "report":
                     self._open_report(result['report_path'])
+                elif choice == "auto_llm":
+                    # Step 1 — open the HTML report from Output/ so the
+                    # user sees the findings in the browser first.
+                    self._log(
+                        "  Opening HTML report before launching "
+                        "VS Code automation...", "accent"
+                    )
+                    self._open_report(result['report_path'])
+                    # Small pause so the browser has time to take
+                    # focus before VS Code launches and steals it.
+                    self.root.after(1500)
+                    # Step 2 — start the VS Code + Gemini Code Assist
+                    # process normally (unchanged automation flow).
+                    self._run_automated_llm_verification(
+                        source_file=self.selected_source_file,
+                        llm_validation_dir=llm_dir,
+                    )
 
             except Exception as e:
                 self._log(f"\nERROR: {str(e)}", "error")
@@ -5054,6 +5260,414 @@ def launch_gui():
                     text="▶  Run Analysis",
                     bg=self.ACCENT, state=tk.NORMAL
                 )
+
+        def _show_completion_dialog(self, total_findings,
+                                    report_path, llm_available):
+            """Modal completion dialog. Returns one of:
+            'report'   → user wants to open the HTML report
+            'auto_llm' → user wants fully-automated LLM verification
+            'close'    → user dismissed the dialog
+            """
+            result_holder = {"choice": "close"}
+            dlg = tk.Toplevel(self.root)
+            dlg.title("Analysis Complete")
+            dlg.configure(bg=self.BG)
+            dlg.transient(self.root)
+            dlg.grab_set()
+            dlg.resizable(False, False)
+
+            w, h = 520, 260 if llm_available else 200
+            x = (dlg.winfo_screenwidth() // 2) - (w // 2)
+            y = (dlg.winfo_screenheight() // 2) - (h // 2)
+            dlg.geometry(f"{w}x{h}+{x}+{y}")
+
+            tk.Label(
+                dlg, text="✓  Analysis Complete",
+                font=("Segoe UI", 14, "bold"),
+                fg=self.SUCCESS, bg=self.BG
+            ).pack(pady=(16, 4))
+
+            tk.Label(
+                dlg,
+                text=f"Found {total_findings} optimization "
+                     f"opportunities.",
+                font=("Segoe UI", 10),
+                fg=self.TEXT, bg=self.BG
+            ).pack(pady=(0, 2))
+
+            tk.Label(
+                dlg,
+                text=f"Report: {os.path.basename(report_path)}",
+                font=("Consolas", 9),
+                fg=self.TEXT_DIM, bg=self.BG
+            ).pack(pady=(0, 12))
+
+            if llm_available:
+                tk.Label(
+                    dlg,
+                    text="Automated LLM Verification will open "
+                         "the browsed file in\nVS Code and submit "
+                         "the validation prompt to Gemini Code "
+                         "Assist —\nno interaction required.",
+                    font=("Segoe UI", 9),
+                    fg=self.TEXT_DIM, bg=self.BG,
+                    justify=tk.CENTER
+                ).pack(pady=(0, 10))
+
+            btn_row = tk.Frame(dlg, bg=self.BG)
+            btn_row.pack(pady=(4, 16))
+
+            def _pick(value):
+                result_holder["choice"] = value
+                dlg.destroy()
+
+            tk.Button(
+                btn_row, text="Open HTML Report",
+                font=("Segoe UI", 10, "bold"),
+                bg=self.ACCENT, fg="white",
+                activebackground=self.ACCENT_LIGHT,
+                relief=tk.FLAT, padx=14, pady=6,
+                cursor="hand2",
+                command=lambda: _pick("report")
+            ).pack(side=tk.LEFT, padx=4)
+
+            if llm_available:
+                tk.Button(
+                    btn_row, text="Run Automated LLM",
+                    font=("Segoe UI", 10, "bold"),
+                    bg=self.SUCCESS, fg="white",
+                    activebackground=self.ACCENT_LIGHT,
+                    relief=tk.FLAT, padx=14, pady=6,
+                    cursor="hand2",
+                    command=lambda: _pick("auto_llm")
+                ).pack(side=tk.LEFT, padx=4)
+
+            tk.Button(
+                btn_row, text="Close",
+                font=("Segoe UI", 10),
+                bg=self.SURFACE2, fg=self.TEXT,
+                activebackground=self.BORDER,
+                relief=tk.FLAT, padx=14, pady=6,
+                cursor="hand2",
+                command=lambda: _pick("close")
+            ).pack(side=tk.LEFT, padx=4)
+
+            dlg.protocol("WM_DELETE_WINDOW", lambda: _pick("close"))
+            self.root.wait_window(dlg)
+            return result_holder["choice"]
+
+        def _run_automated_llm_verification(self, source_file,
+                                             llm_validation_dir):
+            """Fully-automated LLM verification.
+
+            Opens VS Code on the file the user browsed earlier, activates
+            the Gemini Code Assist chat panel via the VS Code command
+            palette, then pastes the validation_prompt.md content joined
+            with findings_for_review.md as the prompt. The user never has
+            to type or click anything for this flow.
+            """
+            import shutil
+            import time as _time
+            import threading
+
+            if not source_file or not os.path.exists(source_file):
+                self._log(
+                    "ERROR: Automated LLM — no browsed source file "
+                    "available to open in VS Code.", "error"
+                )
+                messagebox.showerror(
+                    "Automated LLM",
+                    "Cannot run: no browsed source file is available.\n\n"
+                    "Browse for a .c/.h file first, then re-run."
+                )
+                return
+
+            if not llm_validation_dir or not os.path.isdir(
+                    llm_validation_dir):
+                self._log(
+                    "ERROR: Automated LLM — LLM validation export not "
+                    "found. Enable 'Generate LLM Validation Export'.",
+                    "error"
+                )
+                messagebox.showerror(
+                    "Automated LLM",
+                    "LLM validation export not found.\n\n"
+                    "Enable 'Generate LLM Validation Export' and "
+                    "re-run the analysis."
+                )
+                return
+
+            # The Automated LLM flow uses a dedicated, self-contained
+            # prompt file (automated_llm_prompt.md) that already embeds
+            # findings_for_review.md and is scoped strictly to True /
+            # False Positive validation of the tool's findings against
+            # the source file open in the VS Code editor.
+            auto_prompt_path = (
+                Path(llm_validation_dir) / "automated_llm_prompt.md"
+            )
+            if not auto_prompt_path.exists():
+                # Fall back to the generic prompt + findings for
+                # backward compatibility with older runs.
+                legacy_prompt = (
+                    Path(llm_validation_dir) / "validation_prompt.md"
+                )
+                legacy_findings = (
+                    Path(llm_validation_dir) / "findings_for_review.md"
+                )
+                if not legacy_prompt.exists():
+                    self._log(
+                        f"ERROR: Missing {auto_prompt_path} "
+                        f"(and no legacy prompt fallback).", "error"
+                    )
+                    messagebox.showerror(
+                        "Automated LLM",
+                        f"Required file not found:\n{auto_prompt_path}"
+                    )
+                    return
+                try:
+                    combined_prompt = legacy_prompt.read_text(
+                        encoding="utf-8"
+                    )
+                    if legacy_findings.exists():
+                        combined_prompt += (
+                            "\n\n---\n\n"
+                            "# Findings For Review\n\n"
+                            + legacy_findings.read_text(
+                                encoding="utf-8"
+                            )
+                        )
+                except OSError as exc:
+                    self._log(
+                        f"ERROR reading legacy prompt: {exc}", "error"
+                    )
+                    return
+            else:
+                try:
+                    combined_prompt = auto_prompt_path.read_text(
+                        encoding="utf-8"
+                    )
+                except OSError as exc:
+                    self._log(
+                        f"ERROR reading automated prompt: {exc}",
+                        "error"
+                    )
+                    return
+
+            # Dependency checks — pyautogui + pyperclip drive the GUI.
+            # pygetwindow is optional (for VS Code window re-activation)
+            # and is NOT required; we fall back to relying on focus
+            # staying on VS Code when pygetwindow isn't installed.
+            try:
+                import pyautogui  # type: ignore
+                import pyperclip  # type: ignore
+            except ImportError:
+                self._log(
+                    "ERROR: Automated LLM requires pyautogui and "
+                    "pyperclip. Install with: "
+                    "pip install pyautogui pyperclip pygetwindow",
+                    "error"
+                )
+                messagebox.showerror(
+                    "Missing Dependencies",
+                    "Automated LLM requires Python packages:\n\n"
+                    "  pip install pyautogui pyperclip pygetwindow\n\n"
+                    "(pygetwindow is optional but improves window "
+                    "focus reliability.)\n\nInstall them and try again."
+                )
+                return
+
+            # Locate the VS Code launcher. On Windows `code` is typically
+            # a .cmd shim in the PATH once the user ran 'Shell Command:
+            # Install code command in PATH' from inside VS Code.
+            code_cmd = (
+                shutil.which("code")
+                or shutil.which("code.cmd")
+                or shutil.which("code.exe")
+            )
+            if not code_cmd:
+                self._log(
+                    "ERROR: VS Code 'code' command not found on PATH.",
+                    "error"
+                )
+                messagebox.showerror(
+                    "VS Code Not Found",
+                    "The 'code' command is not on PATH.\n\n"
+                    "Open VS Code → Command Palette → "
+                    "'Shell Command: Install code command in PATH', "
+                    "then retry."
+                )
+                return
+
+            self._log("", "info")
+            self._log(
+                "── Automated LLM Verification ──", "accent"
+            )
+            self._log(
+                f"  Target file : {source_file}", "info"
+            )
+            self._log(
+                f"  Prompt file : {auto_prompt_path}", "info"
+            )
+
+            def _run_palette_command(cmd_text, settle=1.0):
+                """Open the VS Code Command Palette, type a command,
+                press Enter, and wait.
+
+                IMPORTANT: Ctrl+Shift+P opens the palette pre-filled
+                with ">" (command mode). We clear any stale content
+                from a prior invocation, but then we MUST re-type ">"
+                ourselves — otherwise the palette stays in file-search
+                mode (Ctrl+P behavior) and our command text is
+                interpreted as a filename, not a command. This is
+                what caused the earlier "nothing happens" failure.
+                """
+                pyautogui.hotkey("ctrl", "shift", "p")
+                _time.sleep(1.0)
+                # Wipe any stale palette contents from a prior
+                # invocation (including the leading ">").
+                pyautogui.hotkey("ctrl", "a")
+                _time.sleep(0.15)
+                pyautogui.press("delete")
+                _time.sleep(0.15)
+                # Re-insert the command-mode prefix, then the command.
+                pyautogui.typewrite(">", interval=0.02)
+                _time.sleep(0.15)
+                pyautogui.typewrite(cmd_text, interval=0.02)
+                _time.sleep(0.6)
+                pyautogui.press("enter")
+                _time.sleep(settle)
+
+            def _activate_vscode():
+                """Best-effort VS Code window activation — mirrors the
+                AHK `WinActivate ahk_exe Code.exe` call. Silent no-op
+                if pygetwindow isn't available; the automation usually
+                still works because VS Code retains focus after launch.
+                """
+                try:
+                    import pygetwindow as gw  # type: ignore
+                except ImportError:
+                    return
+                try:
+                    wins = [
+                        w for w in gw.getAllWindows()
+                        if "Visual Studio Code" in (w.title or "")
+                    ]
+                    if not wins:
+                        return
+                    win = wins[0]
+                    try:
+                        if win.isMinimized:
+                            win.restore()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    try:
+                        win.activate()
+                    except Exception:  # noqa: BLE001
+                        # activate() often raises on Windows even when
+                        # the activation succeeds — ignore and proceed.
+                        pass
+                    _time.sleep(0.5)
+                except Exception:  # noqa: BLE001
+                    pass
+
+            def _automation_worker():
+                # Sequence mirrors the proven AHK script
+                # (InjectGeminiPrompt_working_version.ahk):
+                #   Run VS Code → Add to Context → Alt+G (open Gemini
+                #   chat) → re-activate VS Code → Gemini: Focus Chat
+                #   View → Ctrl+V → Enter.
+                # The Alt+G hotkey is what actually opens the Gemini
+                # Code Assist chat view reliably; the Focus Chat View
+                # palette command then lands the caret in the input
+                # box so Ctrl+V pastes into chat — not into the .c
+                # file as before.
+                try:
+                    pyautogui.FAILSAFE = True
+
+                    # 1. Launch VS Code with the browsed source file.
+                    self._log(
+                        "  [1/7] Launching VS Code with source file...",
+                        "info"
+                    )
+                    subprocess.Popen(
+                        [code_cmd, str(source_file)],
+                        shell=(os.name == "nt"),
+                    )
+
+                    # 2. Wait for VS Code + Gemini Code Assist to
+                    # finish cold-start activation.
+                    self._log(
+                        "  [2/7] Waiting for VS Code + Gemini Code "
+                        "Assist to finish loading (≈10s)...",
+                        "info"
+                    )
+                    _time.sleep(10)
+                    _activate_vscode()
+
+                    # 3. Add the currently-open source file to Gemini's
+                    # conversation context. Matches the AHK's
+                    # "Gemini: Add to Context" palette step so Gemini
+                    # sees the file contents alongside our prompt.
+                    self._log(
+                        "  [3/7] Adding source file to Gemini "
+                        "context...",
+                        "info"
+                    )
+                    _run_palette_command(
+                        "Gemini: Add to Context", settle=1.5
+                    )
+
+                    # 4. Copy the combined prompt to the clipboard
+                    # BEFORE opening the chat — matches the AHK order
+                    # and avoids any clipboard-contention races.
+                    self._log(
+                        "  [4/7] Copying prompt + findings to "
+                        "clipboard...",
+                        "info"
+                    )
+                    pyperclip.copy(combined_prompt)
+                    _time.sleep(0.5)
+
+                    # 5. Open the Gemini Code Assist chat with the
+                    # extension's dedicated palette command. The chat
+                    # input receives focus automatically when this
+                    # command executes, so a short delay is enough
+                    # before pasting — no separate focus command.
+                    self._log(
+                        "  [5/6] Opening Gemini chat "
+                        "(Gemini Code Assist: Open Chat)...",
+                        "info"
+                    )
+                    _activate_vscode()
+                    _run_palette_command(
+                        "Gemini Code Assist: Open Chat", settle=2.5
+                    )
+
+                    # 6. Short settle, then paste and submit. The
+                    # chat input is already focused after Open Chat.
+                    self._log(
+                        "  [6/6] Pasting prompt and submitting...",
+                        "info"
+                    )
+                    pyautogui.hotkey("ctrl", "v")
+                    _time.sleep(1.0)
+                    pyautogui.press("enter")
+
+                    self._log(
+                        "  ✓ Automated LLM verification launched. "
+                        "Gemini is now processing in VS Code.",
+                        "success"
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    self._log(
+                        f"  ERROR during automation: {exc}", "error"
+                    )
+
+            # Run the keystroke automation off the Tk main thread so the
+            # GUI stays responsive and the focus can shift to VS Code.
+            threading.Thread(
+                target=_automation_worker, daemon=True
+            ).start()
 
         def _open_report(self, path):
             """Open the HTML report in the default browser."""
