@@ -5631,8 +5631,12 @@ def launch_gui():
                     # 5. Open the Gemini Code Assist chat with the
                     # extension's dedicated palette command. The chat
                     # input receives focus automatically when this
-                    # command executes, so a short delay is enough
-                    # before pasting — no separate focus command.
+                    # command executes, but the Gemini chat view can
+                    # take several seconds to finish rendering on
+                    # first open — especially right after adding a
+                    # file to context. Pasting too early lands the
+                    # text in whatever control still has focus
+                    # (usually the editor).
                     self._log(
                         "  [5/6] Opening Gemini chat "
                         "(Gemini Code Assist: Open Chat)...",
@@ -5640,17 +5644,25 @@ def launch_gui():
                     )
                     _activate_vscode()
                     _run_palette_command(
-                        "Gemini Code Assist: Open Chat", settle=2.5
+                        "Gemini Code Assist: Open Chat", settle=7.0
                     )
+                    # Extra settle so the chat view's input field is
+                    # fully mounted and focused before we paste.
+                    self._log(
+                        "      Waiting for Gemini chat view to "
+                        "finish loading...", "info"
+                    )
+                    _time.sleep(4.0)
+                    _activate_vscode()
 
-                    # 6. Short settle, then paste and submit. The
-                    # chat input is already focused after Open Chat.
+                    # 6. Paste and submit. The chat input is focused
+                    # by the Open Chat command.
                     self._log(
                         "  [6/6] Pasting prompt and submitting...",
                         "info"
                     )
                     pyautogui.hotkey("ctrl", "v")
-                    _time.sleep(1.0)
+                    _time.sleep(1.5)
                     pyautogui.press("enter")
 
                     self._log(
