@@ -36,6 +36,7 @@ import re
 import sys
 import html
 import json
+import shutil
 import subprocess
 from dataclasses import dataclass, field, asdict
 from enum import IntEnum
@@ -5040,14 +5041,23 @@ def launch_gui():
             # If user picked a single file, use it; if they picked a folder,
             # use the first discovered source as the representative target.
             if os.path.isfile(target):
-                self.selected_source_file = target
+                original_source_file = target
             else:
-                self.selected_source_file = files[0]
+                original_source_file = files[0]
 
             # Resolve output path
             script_dir = Path(os.path.dirname(os.path.abspath(__file__)))
             output_dir = script_dir / "Output"
             output_path = str(output_dir / "cpu_load_report.html")
+
+            # Copy the browsed source file into Output/ so VS Code opens
+            # the analysis target from a stable, known location.
+            output_dir.mkdir(parents=True, exist_ok=True)
+            output_src_copy = output_dir / os.path.basename(
+                original_source_file
+            )
+            shutil.copy2(original_source_file, output_src_copy)
+            self.selected_source_file = str(output_src_copy)
 
             self._execute_analysis(
                 files=files,
@@ -5101,7 +5111,6 @@ def launch_gui():
             # Remember first staged file as the target to open in VS Code
             # when Automated LLM Verification runs after analysis.
             first_staged_abs = os.path.join(repo, staged_files[0])
-            self.selected_source_file = first_staged_abs
 
             # Output path
             script_dir = Path(os.path.dirname(os.path.abspath(__file__)))
@@ -5109,6 +5118,14 @@ def launch_gui():
             output_path = str(
                 output_dir / "cpu_load_staged_report.html"
             )
+
+            # Copy the staged source file into Output/ so VS Code opens
+            # the analysis target from a stable, known location.
+            output_dir.mkdir(parents=True, exist_ok=True)
+            output_src_copy = output_dir / os.path.basename(first_staged_abs)
+            if os.path.exists(first_staged_abs):
+                shutil.copy2(first_staged_abs, output_src_copy)
+            self.selected_source_file = str(output_src_copy)
 
             self._execute_analysis(
                 files=staged_files,
@@ -5366,7 +5383,6 @@ def launch_gui():
             with findings_for_review.md as the prompt. The user never has
             to type or click anything for this flow.
             """
-            import shutil
             import time as _time
             import threading
 
