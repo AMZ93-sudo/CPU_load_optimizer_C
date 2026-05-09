@@ -5586,14 +5586,19 @@ def launch_gui():
                 )
                 return
 
-            # Locate the VS Code launcher. On Windows `code` is typically
-            # a .cmd shim in the PATH once the user ran 'Shell Command:
-            # Install code command in PATH' from inside VS Code.
-            code_cmd = (
-                shutil.which("code")
-                or shutil.which("code.cmd")
-                or shutil.which("code.exe")
-            )
+            # Locate the VS Code launcher.  On Windows we look for
+            # code.cmd / code.exe *before* bare 'code' because
+            # shutil.which("code") can resolve to a code.py helper
+            # script when .PY is listed in PATHEXT — causing VS Code
+            # to open that script instead of the target .c file.
+            if os.name == "nt":
+                code_cmd = (
+                    shutil.which("code.cmd")
+                    or shutil.which("code.exe")
+                    or shutil.which("code")
+                )
+            else:
+                code_cmd = shutil.which("code")
             if not code_cmd:
                 self._log(
                     "ERROR: VS Code 'code' command not found on PATH.",
@@ -5699,10 +5704,21 @@ def launch_gui():
                         "  [1/7] Launching VS Code with source file...",
                         "info"
                     )
-                    subprocess.Popen(
-                        [code_cmd, str(source_file)],
-                        shell=(os.name == "nt"),
-                    )
+                    # On Windows, passing a list to Popen with
+                    # shell=True sends extra items to cmd.exe, not
+                    # to the command — so VS Code never receives the
+                    # file path and falls back to the last workspace.
+                    # Use a properly-quoted string instead so the path
+                    # (including spaces) reaches VS Code correctly.
+                    if os.name == "nt":
+                        subprocess.Popen(
+                            f'"{code_cmd}" "{str(source_file)}"',
+                            shell=True,
+                        )
+                    else:
+                        subprocess.Popen(
+                            [code_cmd, str(source_file)]
+                        )
 
                     # 2. Wait for VS Code + Gemini Code Assist to
                     # finish cold-start activation.
