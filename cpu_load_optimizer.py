@@ -46,6 +46,38 @@ from datetime import datetime
 from collections import Counter, defaultdict
 
 # ============================================================================
+# SHARED PATTERN FRAGMENTS
+# ============================================================================
+
+# An operand that may be a plain identifier, an array element, or a
+# struct/union member chain — e.g. `x`, `buf[i]`, `cfg->scale`,
+# `state.table[k]->len` (P1.7). The whole thing is captured as group 1.
+_OPERAND = (
+    r'((?:\w+(?:\[[^\]]*\])?'
+    r'(?:\s*(?:->|\.)\s*\w+(?:\[[^\]]*\])?)*))'
+)
+
+# Power-of-two right-hand constants used by C02/C03/C04.
+_POW2 = r'(2|4|8|16|32|64|128|256|512|1024|2048|4096)'
+
+# Matches a pure numeric literal operand (decimal, hex, or binary) with an
+# optional integer-suffix. Used to suppress literal/literal constant folding
+# (P0.7) — e.g. `100 / 4`, `0x40 / 16`.
+_NUMERIC_LITERAL_RE = re.compile(
+    r'^\s*(?:0[xX][0-9A-Fa-f]+|0[bB][01]+|\d+)[uUlL]*\s*$'
+)
+
+
+def _operand_base(operand: str) -> str:
+    """Return the leading identifier of an operand expression.
+
+    `buf[i]` → `buf`, `cfg->scale` → `cfg`, `42` → `42`.
+    """
+    m = re.match(r'\s*([A-Za-z_]\w*)', operand)
+    return m.group(1) if m else operand.strip()
+
+
+# ============================================================================
 # MODELS
 # ============================================================================
 
@@ -113,6 +145,7 @@ class Rule:
     impact_score: int
     fix_template: str = ""
     needs_context: bool = False
+    multiline: bool = False  # If True, match against whole source, not per-line
 
 
 # ============================================================================
@@ -189,6 +222,60 @@ class Preprocessor:
         return ''.join(result), line_map
 
     @staticmethod
+    def mask_strings(source: str) -> str:
+        """Replace string/char-literal *contents* with spaces.
+
+        Length and newlines are preserved so that line numbers and column
+        offsets stay identical to the input. The surrounding quotes are
+        kept; only the characters between them (including any braces) are
+        blanked out. This lets brace-counting passes ignore braces that
+        live inside `printf("{")` or `char c = '{';` (P0.6).
+
+        Assumes comments have already been stripped.
+        """
+        out = []
+        i = 0
+        n = len(source)
+        in_string = False
+        string_char = None
+
+        while i < n:
+            ch = source[i]
+            if ch == '\n':
+                out.append('\n')
+                in_string = False
+                i += 1
+                continue
+
+            if not in_string and ch in ('"', "'"):
+                in_string = True
+                string_char = ch
+                out.append(ch)          # keep opening quote
+                i += 1
+                continue
+
+            if in_string:
+                if ch == '\\' and i + 1 < n:
+                    # Escape sequence — blank both chars (unless newline)
+                    out.append(' ')
+                    out.append('\n' if source[i + 1] == '\n' else ' ')
+                    i += 2
+                    continue
+                if ch == string_char:
+                    in_string = False
+                    out.append(ch)      # keep closing quote
+                    i += 1
+                    continue
+                out.append(' ')         # blank the literal content
+                i += 1
+                continue
+
+            out.append(ch)
+            i += 1
+
+        return ''.join(out)
+
+    @staticmethod
     def get_context(lines: List[str], line_idx: int, window: int = 2) -> str:
         """Get surrounding lines for context."""
         start = max(0, line_idx - window)
@@ -204,6 +291,9 @@ class Preprocessor:
         """Find loop start/end line numbers and their body content."""
         loops = []
         lines = source.split('\n')
+        # Brace counting runs over a string-masked copy so that braces inside
+        # string/char literals don't corrupt body boundaries (P0.6).
+        masked_lines = Preprocessor.mask_strings(source).split('\n')
         loop_pattern = re.compile(r'^\s*(for|while|do)\s*[\(\{]')
 
         i = 0
@@ -216,14 +306,13 @@ class Preprocessor:
                 found_open = False
 
                 for j in range(i, len(lines)):
-                    line = lines[j]
-                    for ch in line:
+                    for ch in masked_lines[j]:
                         if ch == '{':
                             brace_count += 1
                             found_open = True
                         elif ch == '}':
                             brace_count -= 1
-                    body_lines.append(line)
+                    body_lines.append(lines[j])
                     if found_open and brace_count == 0:
                         loops.append((loop_start, j, '\n'.join(body_lines)))
                         break
@@ -235,6 +324,8 @@ class Preprocessor:
         """Extract function name, start line, end line, and body."""
         functions = []
         lines = source.split('\n')
+        # Brace counting runs over a string-masked copy (P0.6).
+        masked_lines = Preprocessor.mask_strings(source).split('\n')
         # Match function definitions (simplified — works for most C code)
         func_pattern = re.compile(
             r'^[\w\s\*]+\s+(\w+)\s*\([^)]*\)\s*\{?\s*$'
@@ -259,7 +350,7 @@ class Preprocessor:
 
                 for j in range(i, len(lines)):
                     line = lines[j]
-                    for ch in line:
+                    for ch in masked_lines[j]:
                         if ch == '{':
                             brace_count += 1
                             found_open = True
@@ -287,6 +378,14 @@ class RulesEngine:
 
     def __init__(self):
         self.rules = self._build_rules()
+        # Per-file analysis state (populated by analyze(); defaults keep
+        # validators safe if invoked standalone).
+        self._functions: List[Dict] = []
+        self._loop_bodies_text: str = ""
+        self._symbol_types: Dict[str, str] = {}
+        self._const_names: Set[str] = set()
+        self._struct_member_lines: Set[int] = set()
+        self._float32_names: Set[str] = set()
 
     def _build_rules(self) -> List[Rule]:
         rules = []
@@ -325,9 +424,9 @@ class RulesEngine:
             id="C02", name="Division by Power of 2",
             severity=Severity.CRITICAL, category="Arithmetic",
             pattern=re.compile(
-                r'(\w+)\s*/\s*(2|4|8|16|32|64|128|256|512|1024|2048|4096)\b'
+                _OPERAND + r'\s*/\s*' + _POW2 + r'\b'
             ),
-            validator=self._validate_not_float_context,
+            validator=self._validate_runtime_operand,
             description=(
                 "Integer division by a constant power of 2 detected. "
                 "Hardware integer division (DIV) costs 12-20+ CPU cycles "
@@ -335,27 +434,31 @@ class RulesEngine:
                 "bit-shift (>>) costs only 1-2 cycles."
             ),
             recommendation=(
-                "Replace `x / N` with `x >> log2(N)` for unsigned integers. "
-                "For signed integers, be aware that right-shift of negative "
-                "values is implementation-defined; use unsigned types or "
-                "explicit handling."
+                "Replace `x / N` with `x >> log2(N)` for UNSIGNED integers "
+                "only. For signed integers the two are NOT equivalent: "
+                "division truncates toward zero while arithmetic right-shift "
+                "floors toward −∞ (different results for negative values) — "
+                "so this rule is demoted to MEDIUM with a 'verify semantics' "
+                "note when the operand resolves to a signed type. Also verify "
+                "your build's -O level: GCC/armclang already do this strength "
+                "reduction at -O1+."
             ),
             evidence=(
                 "Renesas Embedded C III: 'MUL takes 12-20 cycles, SHIFT "
                 "takes 2 cycles'; ARM Architecture Ref Manual — instruction "
-                "cycle counts"
+                "cycle counts; GCC Optimize Options (strength reduction)"
             ),
             impact_score=85,
-            fix_template="x / {N} → x >> {shift}"
+            fix_template="x / {N} → x >> {shift}  (unsigned only)"
         ))
 
         rules.append(Rule(
             id="C03", name="Modulo by Power of 2",
             severity=Severity.CRITICAL, category="Arithmetic",
             pattern=re.compile(
-                r'(\w+)\s*%\s*(2|4|8|16|32|64|128|256|512|1024|2048|4096)\b'
+                _OPERAND + r'\s*%\s*' + _POW2 + r'\b'
             ),
-            validator=self._validate_not_float_context,
+            validator=self._validate_runtime_operand,
             description=(
                 "Modulo operation with a power-of-2 constant detected. "
                 "The modulo operator compiles to an expensive DIV instruction. "
@@ -376,26 +479,30 @@ class RulesEngine:
 
         rules.append(Rule(
             id="C04", name="Multiplication by Power of 2",
-            severity=Severity.CRITICAL, category="Arithmetic",
+            severity=Severity.MEDIUM, category="Arithmetic",
             pattern=re.compile(
-                r'(\w+)\s*\*\s*(2|4|8|16|32|64|128|256|512|1024|2048|4096)\b'
+                _OPERAND + r'\s*\*\s*' + _POW2 + r'\b'
             ),
-            validator=self._validate_not_float_context,
+            validator=self._validate_runtime_operand,
             description=(
                 "Integer multiplication by a constant power of 2 detected. "
-                "While many compilers optimize this automatically, some "
-                "embedded compilers with low optimization levels do not. "
-                "MUL can cost 3-12 cycles vs 1 cycle for left-shift."
+                "GCC/armclang perform strength reduction for power-of-2 "
+                "multiply at -O1 and above, so this is virtually always "
+                "auto-optimized — relevant mainly at -O0 or with certified "
+                "compilers running restricted optimization. MUL can cost "
+                "3-12 cycles vs 1 cycle for left-shift."
             ),
             recommendation=(
-                "Replace `x * N` with `x << log2(N)`. Verify your compiler "
-                "isn't already doing this by checking the disassembly."
+                "Replace `x * N` with `x << log2(N)` only after confirming "
+                "your build's -O level leaves it un-optimized (check the "
+                "disassembly). At -O1+ the compiler already does this."
             ),
             evidence=(
+                "GCC Optimize Options (strength reduction at -O1+); "
                 "Renesas Embedded C III — MUL vs SHIFT cycle comparison; "
                 "ARM Cortex-M instruction timing tables"
             ),
-            impact_score=75,
+            impact_score=55,
             fix_template="x * {N} → x << {shift}"
         ))
 
@@ -403,15 +510,19 @@ class RulesEngine:
             id="C05", name="Expensive Math Function in Loop",
             severity=Severity.CRITICAL, category="Loop",
             pattern=re.compile(
-                r'\b(sqrt|sqrtf|sin|sinf|cos|cosf|tan|tanf|atan|atan2|'
-                r'pow|powf|log|logf|log10|exp|expf|fabs|fabsf|'
-                r'ceil|ceilf|floor|floorf|asin|acos)\s*\('
+                r'\b(sqrt|sqrtf|sin|sinf|cos|cosf|tan|tanf|atan|atanf|'
+                r'atan2|atan2f|pow|powf|log|logf|log10|log10f|exp|expf|'
+                r'asin|asinf|acos|acosf)\s*\('
             ),
             validator=None,
             description=(
-                "Expensive math library function detected. These functions "
-                "typically cost 50-200+ CPU cycles each. If called inside "
-                "a loop, the total cost multiplies by iteration count."
+                "Expensive transcendental math library function detected. "
+                "These functions typically cost 50-200+ CPU cycles each. If "
+                "called inside a loop, the total cost multiplies by iteration "
+                "count. Note: fabs/fabsf, floorf/ceilf are intentionally "
+                "excluded — on an FPU-equipped core (Cortex-M4F/M7) they map "
+                "to single instructions (VABS.F32, VRINTM/VRINTP) and are "
+                "cheap (P1.6)."
             ),
             recommendation=(
                 "Consider: (1) Pre-compute results outside the loop if "
@@ -462,14 +573,18 @@ class RulesEngine:
             id="H01", name="Potential Loop-Invariant Computation",
             severity=Severity.HIGH, category="Loop",
             pattern=re.compile(
-                r'\b(sizeof|strlen)\s*\([^)]+\)'
+                r'\b(strlen|strchr|strstr|memchr)\s*\([^)]+\)'
             ),
             validator=None,
             description=(
-                "A function call that may return a constant result is used "
-                "inside a scope that could be a loop body. If this value "
-                "doesn't change per iteration, computing it once before "
-                "the loop saves cycles proportional to the iteration count."
+                "An O(n) string/memory-scanning call (strlen, strchr, "
+                "strstr, memchr) is used inside a scope that could be a "
+                "loop body. Each call walks the buffer at runtime; if the "
+                "argument doesn't change per iteration, computing it once "
+                "before the loop saves cycles proportional to the iteration "
+                "count. Note: sizeof is intentionally NOT flagged — it is a "
+                "compile-time constant with zero runtime cost (C11 "
+                "§6.5.3.4), except for VLAs which MISRA prohibits."
             ),
             recommendation=(
                 "Hoist invariant computations outside the loop. Store the "
@@ -537,9 +652,10 @@ class RulesEngine:
             id="H04", name="Function Call in Tight Loop",
             severity=Severity.HIGH, category="Loop",
             pattern=re.compile(
-                r'(?:for|while)\s*\([^)]*\)\s*\{[^}]{0,200}\b(\w+)\s*\([^)]*\)\s*;'
+                r'\b(\w+)\s*\([^;{]*\)\s*;'
             ),
             validator=self._validate_not_standard_func,
+            needs_context=True,  # Matched against loop bodies (P0.1)
             description=(
                 "A non-trivial function call detected inside a loop body. "
                 "Each call incurs prologue/epilogue overhead (register "
@@ -619,19 +735,27 @@ class RulesEngine:
             id="H07", name="Large Struct Pass-by-Value",
             severity=Severity.HIGH, category="Memory",
             pattern=re.compile(
-                r'\b\w+\s+\w+\s*\([^)]*\bstruct\s+\w+\s+(?![\*])\w+[^)]*\)'
+                r'\b\w+\s+\w+\s*\('
+                r'[^)]*?'
+                r'(?:struct\s+\w+|(\w+(?:_t|_T|Type|_st)))'
+                r'\s+(?!\*)\w+'
+                r'[^)]*\)'
             ),
-            validator=None,
+            validator=self._validate_struct_by_value,
             description=(
-                "A struct appears to be passed by value to a function. "
-                "This copies the entire struct onto the stack for each call. "
-                "For large structs, this is a major CPU and memory waste."
+                "A struct appears to be passed by value to a function. This "
+                "copies the entire struct onto the stack for each call. The "
+                "rule also flags typedef'd struct-like parameters (`*_t`, "
+                "`*_T`, `*Type`, `*_st`) passed by value, since AUTOSAR/Valeo "
+                "code rarely uses the literal `struct` keyword (P1.3). For "
+                "large structs this is a major CPU and memory waste."
             ),
             recommendation=(
                 "Pass structs by pointer: "
                 "`void func(const struct MyStruct *s)` instead of "
                 "`void func(struct MyStruct s)`. Add `const` if the "
-                "function doesn't modify the struct."
+                "function doesn't modify the struct. (Typedef matches are "
+                "heuristic — confirm the type is actually a struct.)"
             ),
             evidence=(
                 "Embedded.com — Engineering Embedded Software Part 1; "
@@ -641,31 +765,12 @@ class RulesEngine:
             fix_template="Pass by const pointer instead of by value"
         ))
 
-        rules.append(Rule(
-            id="H08", name="Redundant Repeated Computation",
-            severity=Severity.HIGH, category="Arithmetic",
-            pattern=re.compile(
-                r'(\w+\s*[\+\-\*\/\%\&\|\^]\s*\w+).*\1'
-            ),
-            validator=None,
-            description=(
-                "The same arithmetic expression appears to be computed "
-                "multiple times in the same scope. Each redundant "
-                "computation wastes CPU cycles."
-            ),
-            recommendation=(
-                "Store the result in a local temporary variable and "
-                "reuse it. The compiler may do CSE (Common Subexpression "
-                "Elimination) at high optimization levels, but explicit "
-                "caching guarantees it."
-            ),
-            evidence=(
-                "Common Subexpression Elimination — standard compiler "
-                "optimization theory; Dragon Book Ch.10"
-            ),
-            impact_score=62,
-            fix_template="const type temp = expr; // reuse temp"
-        ))
+        # H08 (Redundant Repeated Computation) was REMOVED in the v2 plan
+        # (P1.4): the single-line `(\w+ op \w+).*\1` regex produced false
+        # positives ~80% of the time (it flagged unrelated reuses on one
+        # line and missed the common multi-line case). A correct CSE check
+        # needs the AST backend (P3.2); until then, no rule is better than
+        # a wrong one.
 
         # ── MEDIUM ───────────────────────────────────────────────────────
 
@@ -673,7 +778,7 @@ class RulesEngine:
             id="M01", name="Missing const on Read-Only Pointer Parameter",
             severity=Severity.MEDIUM, category="Qualifiers",
             pattern=re.compile(
-                r'\b\w+\s+\w+\s*\(\s*(?:\w+\s+)*(\w+)\s*\*\s*\w+[^)]*\)'
+                r'\b\w+\s+\w+\s*\(\s*(?:\w+\s+)*(\w+)\s*\*\s*(\w+)[^)]*\)'
             ),
             validator=self._validate_missing_const,
             description=(
@@ -731,18 +836,20 @@ class RulesEngine:
             pattern=re.compile(
                 r'\b(extern|volatile)\s+\w+\s+(\w+)\s*;'
             ),
-            validator=None,
+            validator=self._validate_global_in_loop,
             description=(
-                "A global or extern variable may be accessed inside a "
-                "loop. The compiler must reload such variables from memory "
-                "on each iteration (can't keep them in registers) because "
+                "A global or extern variable is accessed inside a loop. "
+                "The compiler must reload such variables from memory on "
+                "each iteration (can't keep them in registers) because "
                 "they could be modified by interrupts or other threads."
             ),
             recommendation=(
-                "Cache the global variable in a local variable before "
-                "the loop: `uint32_t local_copy = global_var;` Then use "
-                "the local copy inside the loop. Write back after the "
-                "loop if needed."
+                "Cache the global variable in a local before the loop: "
+                "`uint32_t local_copy = global_var;` then use the local "
+                "copy inside the loop. SAFETY-CRITICAL CAVEAT: caching a "
+                "`volatile` into a local is only valid when no ISR/DMA "
+                "coherence is required mid-loop — if the value must reflect "
+                "hardware/ISR updates every iteration, do NOT cache it."
             ),
             evidence=(
                 "Embedded.com — loop optimization; Patterson & Hennessy "
@@ -777,7 +884,8 @@ class RulesEngine:
                 "Pareto principle: 80% execution in 20% of code"
             ),
             impact_score=55,
-            fix_template="Refactor to reduce nesting depth"
+            fix_template="Refactor to reduce nesting depth",
+            multiline=True  # P0.1 — nested loops span many lines
         ))
 
         rules.append(Rule(
@@ -801,7 +909,8 @@ class RulesEngine:
             ),
             evidence="MISRA C:2012 Rule 16.4 — every switch shall have default",
             impact_score=35,
-            fix_template="Add default: case to switch statement"
+            fix_template="Add default: case to switch statement",
+            multiline=True  # P0.1 — switch body spans many lines
         ))
 
         rules.append(Rule(
@@ -899,16 +1008,17 @@ class RulesEngine:
                 "ARM branch prediction documentation"
             ),
             impact_score=25,
-            fix_template="Convert to switch statement or lookup table"
+            fix_template="Convert to switch statement or lookup table",
+            multiline=True  # P0.1 — if-else chain spans many lines
         ))
 
         rules.append(Rule(
             id="L03", name="Computation in Array Index",
             severity=Severity.LOW, category="Arithmetic",
             pattern=re.compile(
-                r'\w+\s*\[\s*\w+\s*[\+\-\*\/]\s*\w+\s*\]'
+                r'\w+\s*\[\s*(\w+)\s*[\+\-\*\/]\s*(\w+)\s*\]'
             ),
-            validator=None,
+            validator=self._validate_array_index_runtime,
             description=(
                 "A complex expression is used as an array index. While "
                 "many compilers handle this well with addressing modes, "
@@ -963,68 +1073,450 @@ class RulesEngine:
                 r'|float|double)\s+(\w+)\s*;',
                 re.MULTILINE
             ),
-            validator=None,
+            validator=self._validate_uninit_var,
             description=(
-                "A variable is declared without initialization. "
-                "Uninitialized data goes to BSS section which requires "
-                "runtime zeroing. Initialized data goes to DATA section "
-                "and is loaded directly."
+                "A variable is declared without an initializer. For static-"
+                "storage variables, an explicit zero (or no) initializer "
+                "lands in `.bss`, which the startup code clears in bulk and "
+                "which costs NO flash. A non-zero initializer instead lands "
+                "in `.data`, which DOES cost flash plus a flash→RAM copy at "
+                "startup. The main value of this rule is preventing "
+                "undefined-behaviour reads of uninitialized automatics, not "
+                "a section-cost saving."
             ),
             recommendation=(
-                "Initialize variables at declaration: "
-                "`uint32_t counter = 0U;` This avoids BSS-to-DATA copy "
-                "overhead and prevents undefined-behavior bugs."
+                "Initialize automatics before first use to avoid undefined "
+                "behaviour: `uint32_t counter = 0U;`. Note: do NOT add "
+                "non-zero initializers to large static tables purely for "
+                "style — a zero-init/uninit static stays in cheap `.bss`, "
+                "while a non-zero init moves it to `.data` (flash + startup "
+                "copy cost)."
             ),
             evidence=(
-                "Renesas Embedded C III — data initialization sections; "
-                "MISRA C:2012 Rule 9.1"
+                "Renesas Embedded C III — .bss vs .data initialization "
+                "sections; MISRA C:2012 Rule 9.1"
             ),
             impact_score=15,
             fix_template="Initialize variable at declaration"
         ))
 
+        # ── NEW RULES (Phase 1) ──────────────────────────────────────────
+
+        # C07 — implicit double promotion via unsuffixed float literal (P1.2)
+        rules.append(Rule(
+            id="C07", name="Double Promotion via Unsuffixed Float Literal",
+            severity=Severity.HIGH, category="Arithmetic",
+            pattern=re.compile(
+                r'(?<![\w.])\d+\.\d+(?:[eE][+-]?\d+)?(?![fF\d])'
+            ),
+            validator=self._validate_double_literal_float_ctx,
+            description=(
+                "A floating-point literal WITHOUT an `f` suffix is used in a "
+                "float computation. An unsuffixed literal like `3.14` has "
+                "type `double`, so the whole expression is promoted to "
+                "double. The Cortex-M4F FPU is single-precision ONLY — any "
+                "double operation falls into software emulation (10-100× "
+                "slower)."
+            ),
+            recommendation=(
+                "Add the `f` suffix to float literals: `3.14f`, `1.0f`. "
+                "Build with `-Wdouble-promotion -fsingle-precision-constant` "
+                "to catch these automatically."
+            ),
+            evidence=(
+                "Arm — float vs double on Cortex-M4 (KA005775); "
+                "GCC Warning Options: -Wdouble-promotion"
+            ),
+            impact_score=78,
+            fix_template="Append 'f' suffix: 3.14 → 3.14f"
+        ))
+
+        # C08 — double-precision libm call where the f-variant exists (P1.2)
+        rules.append(Rule(
+            id="C08", name="Double-Precision libm Call in Float Context",
+            severity=Severity.CRITICAL, category="Arithmetic",
+            pattern=re.compile(
+                r'\b(sin|cos|tan|sqrt|pow|exp|log|log10|atan|atan2|asin|'
+                r'acos|fmod|fabs|floor|ceil)\s*(?=\()'
+            ),
+            validator=self._validate_double_libm_float_arg,
+            description=(
+                "A double-precision libm function (e.g. `sqrt`, `sin`) is "
+                "called with float operands. On the single-precision "
+                "Cortex-M4F FPU the double version runs in software "
+                "emulation; the `f` variant (`sqrtf`, `sinf`) stays in "
+                "hardware. This is the single highest-value fix for ADAS "
+                "single-precision targets."
+            ),
+            recommendation=(
+                "Use the single-precision variant: `sqrtf`, `sinf`, `cosf`, "
+                "`powf`, `expf`, `logf`, `fabsf`, etc. Include <math.h> and "
+                "build with -fsingle-precision-constant."
+            ),
+            evidence=(
+                "Arm — float vs double on Cortex-M4 (KA005775); "
+                "ARM Cortex-M4F FPU is single-precision only"
+            ),
+            impact_score=88,
+            fix_template="sqrt(x) → sqrtf(x)  (f-variant)"
+        ))
+
+        # C09 — chained / repeated division in one expression (P1.10)
+        rules.append(Rule(
+            id="C09", name="Chained Division in One Expression",
+            severity=Severity.HIGH, category="Arithmetic",
+            pattern=re.compile(
+                r'\b[A-Za-z_0-9]+(?:\[[^\]]*\])?\s*/\s*'
+                r'[A-Za-z_0-9]+(?:\[[^\]]*\])?\s*/\s*'
+                r'[A-Za-z_0-9]+(?:\[[^\]]*\])?'
+            ),
+            validator=self._validate_runtime_chain,
+            description=(
+                "Two or more divisions are chained in one expression "
+                "(`a/b/c`). Integer division (SDIV/UDIV) is the slowest "
+                "integer operation on Cortex-M (2-12 cycles each). "
+                "Restructuring to a single division removes one of them."
+            ),
+            recommendation=(
+                "Combine into one division where algebraically valid: "
+                "`a/b/c` → `a/(b*c)` (verify the product cannot overflow). "
+                "Beware operator precedence and rounding when refactoring."
+            ),
+            evidence=(
+                "Embedded C Optimization Techniques (Emertxe) — 'integer "
+                "division is the slowest integer arithmetic operation'"
+            ),
+            impact_score=64,
+            fix_template="a/b/c → a/(b*c)  (verify no overflow)"
+        ))
+
+        # H09 — count-up loop with unused index → count-down (P1.10)
+        rules.append(Rule(
+            id="H09", name="Count-Up Loop With Unused Index",
+            severity=Severity.MEDIUM, category="Loop",
+            pattern=None,  # custom handler in analyze()
+            validator=None,
+            description=(
+                "A `for` loop counts up with an index that is never "
+                "referenced in the body. Counting DOWN to zero compiles to a "
+                "single flag-setting `SUBS` + `BNE` on ARM, instead of "
+                "`ADD` + `CMP` + branch — saving an instruction per "
+                "iteration. Only worthwhile when the index is genuinely "
+                "unused (otherwise reversed indexing costs more and hurts "
+                "readability)."
+            ),
+            recommendation=(
+                "If the index is only a repeat counter, count down: "
+                "`for (i = N; i != 0; i--)`. Do NOT reverse loops whose "
+                "index addresses memory in order."
+            ),
+            evidence=(
+                "ARM — Writing Efficient Code for ARM (SUBS/BNE vs "
+                "ADD/CMP loop termination)"
+            ),
+            impact_score=48,
+            fix_template="for(i=0;i<N;i++) → for(i=N;i!=0;i--)"
+        ))
+
+        # H10 — mixed signed/unsigned arithmetic in one expression (P1.10)
+        rules.append(Rule(
+            id="H10", name="Mixed Signed/Unsigned Arithmetic",
+            severity=Severity.MEDIUM, category="Arithmetic",
+            pattern=re.compile(
+                r'\b([A-Za-z_]\w*)\s*[-+*/%]\s*([A-Za-z_]\w*)\b'
+            ),
+            validator=self._validate_mixed_signedness,
+            description=(
+                "An expression mixes a signed and an unsigned operand. The "
+                "implicit conversion generates extra sign-extension/masking "
+                "instructions and is a MISRA C:2012 Rule 10.4 (essential "
+                "type) violation."
+            ),
+            recommendation=(
+                "Make operand types consistent. Per vendor guidance use "
+                "UNSIGNED for division, modulo, loop counters and array "
+                "indexing; reserve signed for values that can be negative."
+            ),
+            evidence=(
+                "MISRA C:2012 Rule 10.4; Emertxe optimization notes "
+                "(type-conversion cycle cost)"
+            ),
+            impact_score=46,
+            fix_template="Align operand signedness (prefer unsigned)"
+        ))
+
+        # M09 — while with guaranteed first iteration → do-while (P1.10)
+        rules.append(Rule(
+            id="M09", name="while With Guaranteed First Iteration",
+            severity=Severity.LOW, category="Control Flow",
+            pattern=re.compile(
+                r'\b(\w+)\s*=\s*\d+\s*;\s*while\s*\(\s*\1\b'
+            ),
+            validator=None,
+            description=(
+                "A control variable is assigned a constant immediately "
+                "before a `while` that tests it. If the first iteration is "
+                "guaranteed, a `do-while` removes the redundant initial "
+                "test-and-branch."
+            ),
+            recommendation=(
+                "Convert to `do { … } while (cond);` ONLY if you can verify "
+                "the first iteration always runs. Otherwise leave as-is."
+            ),
+            evidence=(
+                "Embedded.com — Engineering embedded software, Part 2 "
+                "(do-while); ARM do-while guidance"
+            ),
+            impact_score=22,
+            fix_template="while(cond){…} → do{…}while(cond);",
+            multiline=True
+        ))
+
+        # M10 — expensive call first in short-circuit chain (P1.10)
+        rules.append(Rule(
+            id="M10", name="Expensive Call First in Short-Circuit Chain",
+            severity=Severity.MEDIUM, category="Control Flow",
+            pattern=re.compile(
+                r'\bif\s*\(\s*(\w+)\s*\([^()]*\)\s*&&\s*[A-Za-z_]\w*'
+            ),
+            validator=self._validate_short_circuit,
+            description=(
+                "A function call is the FIRST operand of a `&&` chain whose "
+                "second operand is a cheap test. Short-circuit evaluation "
+                "means reordering so the cheap test runs first skips the "
+                "call whenever the cheap test fails."
+            ),
+            recommendation=(
+                "Reorder to `if (simple_flag && expensive_fn(x))` — ONLY "
+                "when the call is side-effect-free (cannot be verified "
+                "statically; confirm before applying)."
+            ),
+            evidence=(
+                "C11 §6.5.13/14 — && short-circuit semantics; embedded "
+                "optimization canon"
+            ),
+            impact_score=40,
+            fix_template="if(fn(x) && flag) → if(flag && fn(x))"
+        ))
+
+        # M11 — repeated pointer-chase inside a loop body (P1.10)
+        rules.append(Rule(
+            id="M11", name="Repeated Pointer-Chase in Loop",
+            severity=Severity.MEDIUM, category="Memory",
+            pattern=None,  # custom handler in analyze()
+            validator=None,
+            description=(
+                "The same `ptr->field` / `obj.member` chain is read three or "
+                "more times inside one loop body. Without `restrict` the "
+                "compiler must assume aliasing and reload from memory on "
+                "each access."
+            ),
+            recommendation=(
+                "Cache the value in a local before/at the top of the loop: "
+                "`uint32_t v = ptr->field;` then use `v` inside the loop "
+                "(only if no aliasing write can change it mid-loop)."
+            ),
+            evidence=(
+                "ARM — Writing Efficient Code for ARM (aliasing/restrict, "
+                "register residency); Embedded.com Part 2"
+            ),
+            impact_score=44,
+            fix_template="Cache ptr->field in a local before the loop"
+        ))
+
+        # M12 — file-scope lookup table without const (P1.10)
+        rules.append(Rule(
+            id="M12", name="File-Scope Lookup Table Without const",
+            severity=Severity.MEDIUM, category="Memory",
+            pattern=re.compile(
+                r'^\s*static\s+(?!const\b)[A-Za-z_][\w\s]*?\b(\w+)\s*'
+                r'\[[^\]]*\]\s*=\s*\{',
+                re.MULTILINE
+            ),
+            validator=self._validate_const_table,
+            description=(
+                "A file-scope `static` initialized table is missing `const`. "
+                "Non-const initialized tables live in `.data`: they consume "
+                "RAM AND cost a flash→RAM copy at startup. `const` places "
+                "them in flash (`.rodata`) directly."
+            ),
+            recommendation=(
+                "Add `const` to read-only lookup tables: "
+                "`static const uint8_t table[] = {…};`. On RAM-constrained "
+                "automotive MCUs this is both a startup-CPU and a memory win."
+            ),
+            evidence=(
+                "Emertxe (const → ROM placement); standard linker-section "
+                "behaviour (.rodata vs .data)"
+            ),
+            impact_score=42,
+            fix_template="static <type> t[]={…} → static const <type> t[]={…}",
+            multiline=True
+        ))
+
         return rules
+
+    # ── Analysis-state helpers (symbol & constant tables) ────────────
+
+    # Matches the leading type span of a C declaration, then the name.
+    _DECL_RE = re.compile(
+        r'(?P<type>(?:\b(?:unsigned|signed|const|static|volatile|register|'
+        r'short|long)\b\s+)*'
+        r'\b(?:u?int(?:8|16|32|64)_t|uint_fast\d+_t|size_t|float|double|'
+        r'int|char|short|long|unsigned)\b'
+        r'(?:\s+\b(?:int|long)\b)*)'
+        r'\s+\*?\s*(?P<name>[A-Za-z_]\w*)\s*(?=[=;,)\[])'
+    )
+
+    @staticmethod
+    def _type_category(type_str: str) -> str:
+        """Classify a type span → 'float' | 'unsigned' | 'signed' | 'unknown'."""
+        if 'float' in type_str or 'double' in type_str:
+            return 'float'
+        if ('unsigned' in type_str
+                or re.search(r'\buint(?:8|16|32|64)_t\b', type_str)
+                or re.search(r'\buint_fast\d+_t\b', type_str)
+                or re.search(r'\bsize_t\b', type_str)):
+            return 'unsigned'
+        if re.search(r'\b(?:int(?:8|16|32|64)_t|int|signed|short|long|char)\b',
+                     type_str):
+            return 'signed'
+        return 'unknown'
+
+    def _build_symbol_table(self, cleaned: str) -> Dict[str, str]:
+        """Map identifier → type category for declarations in the source.
+
+        Heuristic, scope-agnostic (last declaration wins). Used to resolve
+        operand signedness (P1.1) and float context (P1.8) without a fragile
+        fixed-size lookback window.
+        """
+        table: Dict[str, str] = {}
+        for m in self._DECL_RE.finditer(cleaned):
+            table[m.group('name')] = self._type_category(m.group('type'))
+        return table
+
+    @staticmethod
+    def _build_constant_table(cleaned: str) -> Set[str]:
+        """Collect names of integer compile-time constants (P0.7).
+
+        `#define NAME <number>` and `[static] const <inttype> NAME = <number>;`.
+        Operands resolving to these fold at compile time (constant
+        propagation), so power-of-2 findings on them are false positives.
+        """
+        names: Set[str] = set()
+        num = r'(?:0[xX][0-9A-Fa-f]+|0[bB][01]+|\d+)[uUlL]*'
+        for m in re.finditer(
+                rf'^\s*#define\s+([A-Za-z_]\w*)\s+\(?\s*{num}\s*\)?\s*$',
+                cleaned, re.MULTILINE):
+            names.add(m.group(1))
+        for m in re.finditer(
+                rf'\bconst\s+[\w\s\*]*?\b([A-Za-z_]\w*)\s*=\s*{num}\s*;',
+                cleaned):
+            names.add(m.group(1))
+        return names
+
+    @staticmethod
+    def _find_struct_member_lines(cleaned: str) -> Set[int]:
+        """Return the set of line indices that sit inside a struct/union body.
+
+        Used to suppress L05 false positives on struct members (P1.5).
+        """
+        lines = cleaned.split('\n')
+        masked = Preprocessor.mask_strings(cleaned).split('\n')
+        inside: Set[int] = set()
+        open_re = re.compile(r'\b(?:struct|union)\b[^;{]*\{')
+        i = 0
+        n = len(lines)
+        while i < n:
+            if open_re.search(lines[i]):
+                depth = 0
+                started = False
+                for j in range(i, n):
+                    for ch in masked[j]:
+                        if ch == '{':
+                            depth += 1
+                            started = True
+                        elif ch == '}':
+                            depth -= 1
+                    if started and j > i:
+                        inside.add(j)
+                    if started and depth == 0:
+                        i = j
+                        break
+            i += 1
+        return inside
+
+    def _classify_operand_type(self, base: str, lines: List[str],
+                               line_idx: int) -> str:
+        """Resolve an identifier to 'float'|'unsigned'|'signed'|'unknown'.
+
+        Consults the per-file symbol table first (P1.8); falls back to a
+        20-line lookback for anything declared out of the table's reach.
+        """
+        cat = self._symbol_types.get(base)
+        if cat:
+            return cat
+        start = max(0, line_idx - 20)
+        for k in range(line_idx, start - 1, -1):
+            dm = re.search(
+                rf'((?:unsigned|signed|const|static|volatile|short|long)\s+)*'
+                rf'(u?int(?:8|16|32|64)_t|size_t|float|double|int|char|'
+                rf'short|long|unsigned)\b[\w\s\*]*?\b{re.escape(base)}\b',
+                lines[k]
+            )
+            if dm:
+                return self._type_category(dm.group(0))
+        return 'unknown'
 
     # ── Validators (False Positive Reduction) ────────────────────────
 
-    def _validate_not_float_context(self, match, line: str,
-                                     lines: List[str],
-                                     line_idx: int) -> bool:
-        """Reject if the operation is on float/double variables.
+    def _validate_runtime_operand(self, match, line: str,
+                                  lines: List[str],
+                                  line_idx: int) -> bool:
+        """C02/C03/C04 gate: operand must be a genuine runtime value.
 
-        Checks for DIRECT float/double declaration of the variable,
-        not just any float keyword appearing near the variable name.
-        This avoids false positives like:
-          float my_func(int raw_adc)  ← raw_adc is int, not float
+        Suppresses three classes of false positive:
+          * pure numeric-literal operands — constant folded at any -O,
+            including -O0 (P0.7);
+          * macro / const integer constants — constant propagated (P0.7);
+          * float/double operands — power-of-2 strength reduction does not
+            apply to floats (P1.8 + the original float-context check).
         """
-        var_name = match.group(1)
-        start = max(0, line_idx - 20)
-        context = '\n'.join(lines[start:line_idx + 1])
-
-        # Pattern 1: Direct variable declaration
-        #   float var_name   /  double var_name  /  float *var_name
-        direct_decl = re.search(
-            rf'\b(?:float|double)\s+\*?\s*{re.escape(var_name)}\b',
-            context
-        )
-        if direct_decl:
-            return False  # Variable IS float → skip this rule
-
-        # Pattern 2: Variable assigned from float cast or float literal
-        #   var_name = (float)...  /  var_name = 3.14
-        float_assign = re.search(
-            rf'\b{re.escape(var_name)}\s*=\s*\((?:float|double)\)',
-            context
-        )
-        if float_assign:
+        operand = match.group(1)
+        if _NUMERIC_LITERAL_RE.match(operand):
+            return False  # literal / literal → compiler folds it
+        base = _operand_base(operand)
+        if base in self._const_names:
+            return False  # named compile-time constant → folded
+        if self._classify_operand_type(base, lines, line_idx) == 'float':
             return False
-
-        # Pattern 3: Check if current line has float result
-        #   float result = var_name / 8  (result is float, so op is float)
+        # Result-is-float guard (e.g. `float r = x / 8;`)
         if re.match(r'\s*(?:float|double)\s+', line):
             return False
+        return True
 
-        return True  # Variable is NOT float → rule applies
+    # Kept as a thin alias so external callers / tests still resolve it.
+    def _validate_not_float_context(self, match, line: str,
+                                    lines: List[str], line_idx: int) -> bool:
+        base = _operand_base(match.group(1))
+        if self._classify_operand_type(base, lines, line_idx) == 'float':
+            return False
+        if re.match(r'\s*(?:float|double)\s+', line):
+            return False
+        return True
+
+    def _validate_array_index_runtime(self, match, line: str,
+                                      lines: List[str],
+                                      line_idx: int) -> bool:
+        """L03 gate: skip when BOTH index operands fold at compile time.
+
+        `arr[4 + 8]` → `arr[12]` is folded; `arr[i + 8]` still computes at
+        runtime, so it is kept (P0.7).
+        """
+        def is_constant(tok: str) -> bool:
+            return bool(_NUMERIC_LITERAL_RE.match(tok)) or tok in self._const_names
+        a, b = match.group(1), match.group(2)
+        return not (is_constant(a) and is_constant(b))
 
     def _validate_not_standard_func(self, match, line: str,
                                      lines: List[str],
@@ -1055,8 +1547,179 @@ class RulesEngine:
     def _validate_missing_const(self, match, line: str,
                                  lines: List[str],
                                  line_idx: int) -> bool:
-        """Check if const is already present."""
-        return 'const' not in line
+        """M01: flag a pointer param only if it is NOT written in the body.
+
+        Without this check the rule flagged every non-const pointer param,
+        including output buffers where `const` would be wrong (P1.5).
+        """
+        if 'const' in line:
+            return False  # already const
+        param = match.group(2) if (match.lastindex or 0) >= 2 else None
+        if not param:
+            return 'const' not in line
+        # Find the enclosing function body and look for writes to the param.
+        body = None
+        for fn in self._functions:
+            if fn['start'] <= line_idx <= fn['end']:
+                body = fn['body']
+                break
+        if body is None:
+            return True
+        p = re.escape(param)
+        write_patterns = [
+            rf'\*\s*{p}\b\s*=(?!=)',        # *param =
+            rf'\b{p}\s*\[[^\]]*\]\s*=(?!=)',  # param[...] =
+            rf'\bmemcpy\s*\(\s*{p}\b',       # memcpy(param, ...)
+            rf'\bmemset\s*\(\s*{p}\b',       # memset(param, ...)
+            rf'\(\s*{p}\s*\)\s*\+\+', rf'\b{p}\s*\+\+',  # param++
+            rf'\b{p}\s*->\s*\w+\s*=(?!=)',   # param->field =
+        ]
+        for wp in write_patterns:
+            if re.search(wp, body):
+                return False  # param is written → const inappropriate
+        return True
+
+    def _validate_global_in_loop(self, match, line: str,
+                                 lines: List[str],
+                                 line_idx: int) -> bool:
+        """M03: flag an extern/volatile global only if it is used in a loop.
+
+        The old rule fired on the declaration regardless of loop usage
+        (the rule name lied). Now we verify the identifier actually appears
+        inside a loop body (P1.5).
+        """
+        var = match.group(2) if (match.lastindex or 0) >= 2 else None
+        if not var:
+            return False
+        return bool(re.search(rf'\b{re.escape(var)}\b', self._loop_bodies_text))
+
+    def _validate_uninit_var(self, match, line: str,
+                             lines: List[str],
+                             line_idx: int) -> bool:
+        """L05: suppress declarations that live inside a struct/union body
+        (those are members, not uninitialized variables) (P1.5)."""
+        return line_idx not in self._struct_member_lines
+
+    _C_KEYWORDS = {
+        'if', 'else', 'for', 'while', 'do', 'switch', 'case', 'default',
+        'return', 'break', 'continue', 'goto', 'sizeof', 'typedef',
+        'struct', 'union', 'enum', 'const', 'static', 'volatile', 'extern',
+        'register', 'unsigned', 'signed', 'void', 'int', 'char', 'short',
+        'long', 'float', 'double',
+    }
+
+    def _line_identifiers(self, line: str) -> List[str]:
+        """Identifiers on a line, excluding C keywords and function-call names."""
+        out = []
+        for m in re.finditer(r'\b([A-Za-z_]\w*)\b', line):
+            name = m.group(1)
+            if name in self._C_KEYWORDS:
+                continue
+            # Skip function-call names (identifier immediately before '(')
+            after = line[m.end():m.end() + 1]
+            if after == '(':
+                continue
+            out.append(name)
+        return out
+
+    def _validate_double_literal_float_ctx(self, match, line: str,
+                                           lines: List[str],
+                                           line_idx: int) -> bool:
+        """C07: a bare double literal (no `f` suffix) that participates in a
+        float computation promotes the whole expression to double (P1.2).
+
+        Flag only when the statement actually involves `float` — either the
+        `float` keyword on the line or a float-typed operand — so a genuine
+        `double` target is not flagged.
+        """
+        # A genuine `double` statement: the literal matches the target type,
+        # no single-precision promotion penalty → not a C07 finding.
+        if re.search(r'\bdouble\b', line) and not re.search(r'\bfloat\b', line):
+            return False
+        if re.search(r'\bfloat\b', line):
+            return True
+        return any(ident in self._float32_names
+                   for ident in self._line_identifiers(line))
+
+    def _validate_double_libm_float_arg(self, match, line: str,
+                                        lines: List[str],
+                                        line_idx: int) -> bool:
+        """C08: double-precision libm call (sin/cos/sqrt/…) used in a SINGLE-
+        precision float context — the `f` variant (sinf/cosf/sqrtf) avoids
+        the double path (P1.2). A genuine double computation is left alone."""
+        arg = line[match.end():]
+        inner = re.match(r'\s*\(([^)]*)\)', arg)
+        scope = inner.group(1) if inner else line
+        if any(ident in self._float32_names
+               for ident in self._line_identifiers(scope)):
+            return True
+        if re.search(r'\bfloat\b', line) and not re.search(r'\bdouble\b', line):
+            return True
+        return False
+
+    def _validate_runtime_chain(self, match, line: str,
+                                lines: List[str],
+                                line_idx: int) -> bool:
+        """C09: keep chained division only if it has at least one runtime
+        operand (all-literal chains fold at compile time — P0.7)."""
+        return bool(re.search(r'[A-Za-z_]', match.group(0)))
+
+    def _validate_mixed_signedness(self, match, line: str,
+                                   lines: List[str],
+                                   line_idx: int) -> bool:
+        """H10: flag an expression mixing a signed and an unsigned operand
+        (extra extension/masking + MISRA 10.4) — resolved via symbol table."""
+        a = _operand_base(match.group(1))
+        b = _operand_base(match.group(2))
+        ta = self._classify_operand_type(a, lines, line_idx)
+        tb = self._classify_operand_type(b, lines, line_idx)
+        return {ta, tb} == {'signed', 'unsigned'}
+
+    def _validate_short_circuit(self, match, line: str,
+                                lines: List[str],
+                                line_idx: int) -> bool:
+        """M10: `if (expensive_fn(x) && simple_flag)` — reorder so the cheap
+        test short-circuits first. group(1) is the called function name;
+        exclude trivial/standard helpers."""
+        fn = match.group(1)
+        cheap = {'sizeof', 'offsetof'}
+        return fn not in cheap
+
+    # stdint / common scalar `_t` types that are NOT structs (P1.3 exclusion).
+    _SCALAR_T_TYPES = {
+        'uint8_t', 'uint16_t', 'uint32_t', 'uint64_t',
+        'int8_t', 'int16_t', 'int32_t', 'int64_t',
+        'uint_fast8_t', 'uint_fast16_t', 'uint_fast32_t', 'uint_fast64_t',
+        'int_fast8_t', 'int_fast16_t', 'int_fast32_t', 'int_fast64_t',
+        'uint_least8_t', 'uint_least16_t', 'uint_least32_t', 'uint_least64_t',
+        'size_t', 'ssize_t', 'ptrdiff_t', 'wchar_t', 'intptr_t', 'uintptr_t',
+        'intmax_t', 'uintmax_t', 'char_t', 'bool_t', 'float_t', 'double_t',
+    }
+
+    def _validate_struct_by_value(self, match, line: str,
+                                  lines: List[str],
+                                  line_idx: int) -> bool:
+        """H07: keep literal `struct X` by-value params; for typedef'd
+        matches (`*_t`/`*_T`/`*Type`/`*_st`) exclude known scalar `_t`
+        types so `uint32_t x` is not mistaken for a struct (P1.3)."""
+        typedef = match.group(1)
+        if typedef is None:
+            return True  # literal `struct X` parameter
+        return typedef not in self._SCALAR_T_TYPES
+
+    def _validate_const_table(self, match, line: str,
+                              lines: List[str],
+                              line_idx: int) -> bool:
+        """M12: file-scope `static <type> name[] = {…}` without `const` and
+        never written → belongs in `.rodata` (flash) not `.data` (P1.10)."""
+        if 'const' in match.group(0):
+            return False
+        name = match.group(1)
+        # Suppress if the table is written anywhere in the TU.
+        full = '\n'.join(lines)
+        if re.search(rf'\b{re.escape(name)}\s*\[[^\]]*\]\s*=(?!=)', full):
+            return False
+        return True
 
     def _validate_magic_number(self, match, line: str,
                                 lines: List[str],
@@ -1079,6 +1742,49 @@ class RulesEngine:
 
     # ── Core Analysis ────────────────────────────────────────────────
 
+    def _make_finding(self, rule: Rule, file_path: str, orig_line: int,
+                      original_lines: List[str], matched_text: str,
+                      severity: Optional[Severity] = None,
+                      recommendation: Optional[str] = None) -> Finding:
+        """Build a Finding, sharing the boilerplate across all match paths."""
+        snippet = Preprocessor.get_context(
+            original_lines, min(orig_line - 1, len(original_lines) - 1)
+        )
+        return Finding(
+            rule_id=rule.id,
+            rule_name=rule.name,
+            severity=severity if severity is not None else rule.severity,
+            category=rule.category,
+            file_path=file_path,
+            line_number=orig_line,
+            code_snippet=snippet,
+            matched_text=matched_text,
+            description=rule.description,
+            recommendation=(recommendation if recommendation is not None
+                            else rule.recommendation),
+            suggested_fix=rule.fix_template,
+            evidence=rule.evidence,
+            impact_score=rule.impact_score,
+        )
+
+    def _demote_signed(self, rule: Rule, match,
+                       lines: List[str], i: int):
+        """P1.1 — signed power-of-2 div/mul is not shift-equivalent.
+
+        Returns (severity, recommendation) overrides, or (None, None) when
+        no demotion applies.
+        """
+        if rule.id not in ("C02", "C04"):
+            return None, None
+        base = _operand_base(match.group(1))
+        if self._classify_operand_type(base, lines, i) == 'signed':
+            note = (" NOTE: operand resolves to a SIGNED type — shift is "
+                    "NOT semantically equivalent to division/strength-"
+                    "reduction here (rounding differs for negatives). "
+                    "Verify semantics before applying.")
+            return Severity.MEDIUM, rule.recommendation + note
+        return None, None
+
     def analyze(self, source: str, file_path: str,
                 min_severity: Severity = Severity.LOW) -> List[Finding]:
         """Run all rules against the source code."""
@@ -1088,6 +1794,24 @@ class RulesEngine:
         original_lines = source.split('\n')
         loop_bodies = Preprocessor.find_loop_bodies(cleaned)
         functions = Preprocessor.find_function_bodies(cleaned)
+
+        # ── Per-file analysis state consulted by validators ──────────
+        self._functions = functions
+        self._loop_bodies_text = '\n'.join(b for _, _, b in loop_bodies)
+        self._symbol_types = self._build_symbol_table(cleaned)
+        self._const_names = self._build_constant_table(cleaned)
+        self._struct_member_lines = self._find_struct_member_lines(cleaned)
+        # Names declared specifically as single-precision `float` (NOT double)
+        # — needed to distinguish promotion penalties (C07/C08, P1.2).
+        self._float32_names = {
+            m.group(1) for m in re.finditer(
+                r'(?<!\w)float\s+\*?\s*([A-Za-z_]\w*)', cleaned)
+        }
+
+        def line_of(text_block: str, base_line: int, start: int) -> int:
+            """Map a match offset inside *text_block* to an original line."""
+            actual = base_line + text_block[:start].count('\n')
+            return line_map.get(actual + 1, actual + 1)
 
         for rule in self.rules:
             if rule.severity < min_severity:
@@ -1101,100 +1825,126 @@ class RulesEngine:
                 )
                 continue
 
+            # Special case: count-up loop with unused index (P1.10)
+            if rule.id == "H09":
+                findings.extend(
+                    self._detect_countup_unused_index(
+                        loop_bodies, file_path, original_lines, rule, line_map)
+                )
+                continue
+
+            # Special case: repeated pointer-chase in a loop body (P1.10)
+            if rule.id == "M11":
+                findings.extend(
+                    self._detect_pointer_chase(
+                        loop_bodies, file_path, original_lines, rule, line_map)
+                )
+                continue
+
             if rule.pattern is None:
                 continue
 
-            # Context-aware rules (check if inside loop)
-            if rule.needs_context and rule.id == "C05":
+            # ── Context-aware rules: match against each loop body ────
+            if rule.needs_context:
                 for loop_start, loop_end, loop_body in loop_bodies:
+                    body_lines = loop_body.split('\n')
                     for m in rule.pattern.finditer(loop_body):
-                        # Calculate actual line number
-                        match_offset = loop_body[:m.start()].count('\n')
-                        actual_line = loop_start + match_offset
-                        orig_line = line_map.get(actual_line + 1,
-                                                  actual_line + 1)
-
-                        snippet = Preprocessor.get_context(
-                            original_lines, min(orig_line - 1,
-                                                 len(original_lines) - 1)
-                        )
-                        findings.append(Finding(
-                            rule_id=rule.id,
-                            rule_name=rule.name,
-                            severity=rule.severity,
-                            category=rule.category,
-                            file_path=file_path,
-                            line_number=orig_line,
-                            code_snippet=snippet,
-                            matched_text=m.group(0),
-                            description=rule.description,
-                            recommendation=rule.recommendation,
-                            suggested_fix=rule.fix_template,
-                            evidence=rule.evidence,
-                            impact_score=rule.impact_score,
-                        ))
+                        local_idx = loop_body[:m.start()].count('\n')
+                        if rule.validator and not rule.validator(
+                                m, body_lines[local_idx], body_lines,
+                                local_idx):
+                            continue
+                        orig_line = line_of(loop_body, loop_start, m.start())
+                        findings.append(self._make_finding(
+                            rule, file_path, orig_line, original_lines,
+                            m.group(0)))
                 continue
 
-            if rule.needs_context and rule.id == "H01":
-                for loop_start, loop_end, loop_body in loop_bodies:
-                    for m in rule.pattern.finditer(loop_body):
-                        match_offset = loop_body[:m.start()].count('\n')
-                        actual_line = loop_start + match_offset
-                        orig_line = line_map.get(actual_line + 1,
-                                                  actual_line + 1)
-                        snippet = Preprocessor.get_context(
-                            original_lines, min(orig_line - 1,
-                                                 len(original_lines) - 1)
-                        )
-                        findings.append(Finding(
-                            rule_id=rule.id,
-                            rule_name=rule.name,
-                            severity=rule.severity,
-                            category=rule.category,
-                            file_path=file_path,
-                            line_number=orig_line,
-                            code_snippet=snippet,
-                            matched_text=m.group(0),
-                            description=rule.description,
-                            recommendation=rule.recommendation,
-                            suggested_fix=rule.fix_template,
-                            evidence=rule.evidence,
-                            impact_score=rule.impact_score,
-                        ))
+            # ── Multiline rules: match against the whole stripped source ──
+            if rule.multiline:
+                for m in rule.pattern.finditer(cleaned):
+                    orig_line = line_of(cleaned, 0, m.start())
+                    findings.append(self._make_finding(
+                        rule, file_path, orig_line, original_lines,
+                        m.group(0)[:120]))
                 continue
 
-            # Standard pattern matching
+            # ── Standard per-line pattern matching ───────────────────
             for i, line in enumerate(lines):
                 for m in rule.pattern.finditer(line):
-                    # Run validator if present
-                    if rule.validator:
-                        if not rule.validator(m, line, lines, i):
-                            continue
-
+                    if rule.validator and not rule.validator(m, line, lines, i):
+                        continue
                     orig_line = line_map.get(i + 1, i + 1)
-                    snippet = Preprocessor.get_context(
-                        original_lines,
-                        min(orig_line - 1, len(original_lines) - 1)
-                    )
+                    sev, rec = self._demote_signed(rule, m, lines, i)
+                    findings.append(self._make_finding(
+                        rule, file_path, orig_line, original_lines,
+                        m.group(0), severity=sev, recommendation=rec))
 
-                    findings.append(Finding(
-                        rule_id=rule.id,
-                        rule_name=rule.name,
-                        severity=rule.severity,
-                        category=rule.category,
-                        file_path=file_path,
-                        line_number=orig_line,
-                        code_snippet=snippet,
-                        matched_text=m.group(0),
-                        description=rule.description,
-                        recommendation=rule.recommendation,
-                        suggested_fix=rule.fix_template,
-                        evidence=rule.evidence,
-                        impact_score=rule.impact_score,
-                    ))
+        # ── P0.2 — deduplicate identical findings (nested-loop overlap) ──
+        seen = set()
+        deduped = []
+        for f in findings:
+            key = (f.rule_id, f.file_path, f.line_number, f.matched_text)
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(f)
 
-        # Sort by impact score descending
-        findings.sort(key=lambda f: (-f.severity, -f.impact_score))
+        # Sort by severity then impact score descending
+        deduped.sort(key=lambda f: (-f.severity, -f.impact_score))
+        return deduped
+
+    def _detect_countup_unused_index(self, loop_bodies, file_path: str,
+                                     original_lines: List[str], rule: Rule,
+                                     line_map: Dict) -> List[Finding]:
+        """H09 — `for (i=0; i<N; i++)` where `i` is unused in the body."""
+        findings = []
+        header_re = re.compile(
+            r'for\s*\(\s*[^;]*?\b(\w+)\s*=\s*0\b[^;]*;'   # init: idx = 0
+            r'[^;]*;'                                      # cond
+            r'\s*(?:\+\+\s*(\w+)|(\w+)\s*\+\+)\s*\)'       # inc: ++idx / idx++
+        )
+        for loop_start, loop_end, body in loop_bodies:
+            hm = header_re.search(body)
+            if not hm:
+                continue
+            idx = hm.group(1)
+            inc_var = hm.group(2) or hm.group(3)
+            if inc_var != idx:
+                continue
+            # Body with the for-header removed, so the increment doesn't count.
+            body_wo_header = header_re.sub('', body, count=1)
+            if re.search(rf'\b{re.escape(idx)}\b', body_wo_header):
+                continue  # index is used → not a count-down candidate
+            orig_line = line_map.get(loop_start + 1, loop_start + 1)
+            findings.append(self._make_finding(
+                rule, file_path, orig_line, original_lines,
+                f"for(...{idx}...) — index unused in body"))
+        return findings
+
+    def _detect_pointer_chase(self, loop_bodies, file_path: str,
+                              original_lines: List[str], rule: Rule,
+                              line_map: Dict) -> List[Finding]:
+        """M11 — same `ptr->field` / `obj.member` chain read >=3× in a loop."""
+        findings = []
+        chain_re = re.compile(
+            r'[A-Za-z_]\w*(?:\s*(?:->|\.)\s*[A-Za-z_]\w*)+'
+        )
+        for loop_start, loop_end, body in loop_bodies:
+            counts: Dict[str, int] = {}
+            first_at: Dict[str, int] = {}
+            for m in chain_re.finditer(body):
+                key = re.sub(r'\s+', '', m.group(0))
+                counts[key] = counts.get(key, 0) + 1
+                if key not in first_at:
+                    first_at[key] = body[:m.start()].count('\n')
+            for key, cnt in counts.items():
+                if cnt >= 3:
+                    actual = loop_start + first_at[key]
+                    orig_line = line_map.get(actual + 1, actual + 1)
+                    findings.append(self._make_finding(
+                        rule, file_path, orig_line, original_lines,
+                        f"{key} read {cnt}× in loop"))
         return findings
 
     def _detect_recursion(self, functions: List[Dict], file_path: str,
@@ -1369,6 +2119,9 @@ class ReportGenerator:
         "C04": 0.5,   # MUL→SHIFT: 3-12 cycles → 1 cycle (smaller gap)
         "C05": 1.5,   # Math in loop: 50-200 cycles × iteration count
         "C06": 1.0,   # malloc/free: heap mgmt overhead ~100-500 cycles
+        "C07": 1.0,   # double promotion: float expr falls into double path
+        "C08": 1.2,   # double libm vs float variant: 10-100× on M4F SW-emu
+        "C09": 0.5,   # chained division: SDIV/UDIV is slowest int op
         # HIGH: each finding affects 0.2-0.8%
         "H01": 0.4,   # Loop-invariant: saves N × computation_cost
         "H02": 0.6,   # Recursion→Iteration: removes stack frame overhead
@@ -1377,7 +2130,8 @@ class ReportGenerator:
         "H05": 0.2,   # Data type sizing: bus width / cache efficiency
         "H06": 0.3,   # FP comparison: FPU compare vs integer compare
         "H07": 0.4,   # Struct pass-by-value: copies N bytes per call
-        "H08": 0.3,   # Repeated computation: saves duplicate work
+        "H09": 0.2,   # Count-down loop: SUBS+BNE vs ADD+CMP+branch
+        "H10": 0.2,   # Mixed signed/unsigned: extra extension/masking
         # MEDIUM: each finding affects 0.1-0.3%
         "M01": 0.15,  # const: enables compiler register caching
         "M02": 0.1,   # static: enables inlining/dead code elimination
@@ -1386,6 +2140,10 @@ class ReportGenerator:
         "M06": 0.1,   # Switch default: jump table optimization
         "M07": 0.1,   # Signed bit-field: sign extension overhead
         "M08": 0.1,   # Cast chain: conversion instruction overhead
+        "M09": 0.1,   # while→do-while: removes initial test+branch
+        "M10": 0.15,  # short-circuit reorder: skip expensive call
+        "M11": 0.3,   # pointer-chase caching: avoid aliasing reloads
+        "M12": 0.2,   # const lookup table: .rodata vs .data + startup copy
         # LOW: each finding affects 0.02-0.1%
         "L01": 0.05,  # Magic numbers: constant folding missed
         "L02": 0.1,   # If-else→Switch: sequential vs jump table
@@ -2155,13 +2913,18 @@ code.matched {{
     <!-- CPU Load Reduction Estimation -->
     <div class="cpu-estimation-panel">
         <div class="panel-title">
-            Estimated CPU Load Reduction (If Resolved)
+            Opportunity Index (heuristic) — not a measured speed-up
         </div>
         <p class="estimation-disclaimer">
-            Estimates based on ARM Cortex-M instruction cycle ratios,
-            Renesas embedded benchmarks, and IEEE case studies.
-            Actual impact depends on execution frequency of affected code paths.
-            Range represents cold-path (min) to hot-path (max) scenarios.
+            <strong>How to read this number:</strong> it is a heuristic
+            <em>Opportunity Index</em>, NOT a measured or guaranteed CPU
+            saving. It is an additive model over per-rule cycle-ratio weights
+            (ARM Cortex-M instruction timing, Renesas benchmarks), capped per
+            severity, assuming every flagged path is hot. Real impact depends
+            entirely on the execution frequency of the affected code and your
+            compiler's optimization level — most findings on cold paths save
+            ~0%. Treat the range as cold-path (min) → hot-path (max) ceiling.
+            Do not quote it as a delivered performance gain.
         </p>
         <div class="estimation-grid">
             <div class="est-card est-critical">
@@ -2659,6 +3422,33 @@ class LLMValidationExport:
         parts.append("(repeat for every finding)")
         parts.append("```")
         parts.append("")
+        parts.append("## REQUIRED MACHINE-READABLE VERDICT BLOCK")
+        parts.append("")
+        parts.append(
+            "After the human-readable section above, append EXACTLY ONE "
+            "fenced JSON block (and nothing after it) with one entry per "
+            "finding. `finding_index` is the `Finding #N` number shown in "
+            "the findings list below. `verdict` is one of CONFIRMED, "
+            "\"FALSE POSITIVE\", \"CONTEXT NEEDED\", or PARTIAL. This block "
+            "is parsed by the tool (`--apply-validation`) to build the "
+            "developer report — it must be valid JSON."
+        )
+        parts.append("")
+        parts.append("```json")
+        parts.append("{")
+        parts.append('  "verdicts": [')
+        parts.append('    {"finding_index": 1, "rule_id": "C02", '
+                     '"line": 145, "verdict": "CONFIRMED", '
+                     '"reasoning": "runtime operand, division by 8 on a '
+                     'uint32_t hot-path variable", "revised_impact": 80},')
+        parts.append('    {"finding_index": 2, "rule_id": "H01", '
+                     '"line": 210, "verdict": "FALSE POSITIVE", '
+                     '"reasoning": "argument is loop-variant", '
+                     '"revised_impact": null}')
+        parts.append('  ]')
+        parts.append("}")
+        parts.append("```")
+        parts.append("")
         parts.append("---")
         parts.append("")
         parts.append("# Findings For Review")
@@ -3130,7 +3920,7 @@ data — it doesn't waste context generating styles.
       <div class="rb-main">
         <!-- FILL IN: Replace X.X%–Y.Y% with sum of confirmed findings' CPU estimates -->
         <div class="rb-pct">X.X%–Y.Y%</div>
-        <div class="rb-label">Estimated CPU Load Reduction</div>
+        <div class="rb-label">Opportunity Index (heuristic ceiling — not a measured saving)</div>
       </div>
       <div class="rb-divider"></div>
       <div class="rb-detail">
@@ -3277,6 +4067,13 @@ class LLMResponseParser:
                 'reasoning'      – LLM's reasoning string
                 'revised_impact' – LLM-suggested impact (int or None)
         """
+        # ── Preferred: structured JSON contract (P0.3) ──────────────
+        json_results = LLMResponseParser._parse_json_response(
+            response_text, all_findings)
+        if json_results is not None:
+            return json_results
+
+        # ── Fallback: legacy free-text `[C01] … VERDICT:` blocks ─────
         blocks = LLMResponseParser._split_into_blocks(response_text)
         results = []
         used_findings: Set[int] = set()   # track by id() to avoid duplicates
@@ -3308,6 +4105,80 @@ class LLMResponseParser:
             })
 
         # Sort by impact descending
+        results.sort(
+            key=lambda r: -(r['revised_impact'] or r['finding'].impact_score)
+        )
+        return results
+
+    @staticmethod
+    def _parse_json_response(text: str,
+                             all_findings: List[Finding]) -> Optional[List[Dict]]:
+        """Parse the canonical JSON verdict contract (P0.3).
+
+        Expected shape (optionally wrapped in a ```json fence)::
+
+            {"verdicts": [
+                {"finding_index": 1, "rule_id": "C02", "line": 145,
+                 "verdict": "CONFIRMED", "reasoning": "...",
+                 "revised_impact": 70}
+            ]}
+
+        Correlation prefers `finding_index` (1-based position into the
+        findings cache — the most reliable join key); it falls back to
+        rule_id + nearest line. Returns None when no JSON verdict block is
+        present so the caller can try the legacy text format.
+        """
+        data = None
+        # Try fenced ```json ... ``` first, then any bare {...} with verdicts.
+        fence = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', text,
+                          re.DOTALL | re.IGNORECASE)
+        candidates = []
+        if fence:
+            candidates.append(fence.group(1))
+        # Bare object containing "verdicts"
+        bare = re.search(r'(\{[^{}]*"verdicts"\s*:\s*\[.*?\]\s*\})', text,
+                         re.DOTALL)
+        if bare:
+            candidates.append(bare.group(1))
+        for cand in candidates:
+            try:
+                parsed = json.loads(cand)
+                if isinstance(parsed, dict) and 'verdicts' in parsed:
+                    data = parsed
+                    break
+            except (json.JSONDecodeError, ValueError):
+                continue
+        if data is None:
+            return None
+
+        results: List[Dict] = []
+        used: Set[int] = set()
+        for v in data.get('verdicts', []):
+            verdict = str(v.get('verdict', '')).strip().upper()
+            if verdict not in (LLMResponseParser.VERDICT_CONFIRMED,
+                               LLMResponseParser.VERDICT_PARTIAL):
+                continue
+            finding = None
+            idx = v.get('finding_index')
+            if isinstance(idx, int) and 1 <= idx <= len(all_findings):
+                cand_f = all_findings[idx - 1]
+                if id(cand_f) not in used:
+                    finding = cand_f
+            if finding is None:
+                finding = LLMResponseParser._match_finding(
+                    str(v.get('rule_id', '')), v.get('line'),
+                    all_findings, used)
+            if finding is None:
+                continue
+            used.add(id(finding))
+            ri = v.get('revised_impact')
+            results.append({
+                'finding': finding,
+                'verdict': verdict,
+                'reasoning': str(v.get('reasoning', '')).strip(),
+                'revised_impact': ri if isinstance(ri, int) else None,
+            })
+
         results.sort(
             key=lambda r: -(r['revised_impact'] or r['finding'].impact_score)
         )
@@ -4084,7 +4955,7 @@ class LLMValidatedReportGenerator:
     <div class="reduction-banner">
       <div class="rb-main">
         <div class="rb-pct">{total_min}%–{total_max}%</div>
-        <div class="rb-label">Estimated CPU Load Reduction</div>
+        <div class="rb-label">Opportunity Index (heuristic ceiling — not a measured saving)</div>
       </div>
       <div class="rb-divider"></div>
       <div class="rb-detail">
@@ -5731,6 +6602,69 @@ def launch_gui():
 # MAIN CLI
 # ============================================================================
 
+def _gate_and_exit(result: Dict, fail_on: Optional[str]) -> None:
+    """CI gate (P0.5): exit 1 if any finding is at/above *fail_on*.
+
+    Exit codes: 0 = no gating triggered, 1 = findings at/above threshold,
+    2 = tool crash (handled by the caller's try/except).
+    """
+    if not fail_on:
+        return
+    threshold = Severity.from_str(fail_on)
+    offending = [f for f in result.get('findings', [])
+                 if f.severity >= threshold]
+    if offending:
+        worst = max(f.severity for f in offending)
+        print(f"\n  GATE FAILED (--fail-on {fail_on}): "
+              f"{len(offending)} finding(s) at or above {fail_on.upper()} "
+              f"(worst: {worst.name}). Exiting 1.")
+        sys.exit(1)
+    print(f"\n  GATE PASSED (--fail-on {fail_on}): "
+          f"no findings at or above {fail_on.upper()}.")
+
+
+def _run_apply_validation(args) -> None:
+    """One-shot LLM round-trip (P0.3): cache + JSON response → HTML.
+
+    `python cpu_load_optimizer.py --apply-validation <response.json> \
+        --cache <findings_cache.json> -o validated_report.html`
+    """
+    if not args.cache:
+        print("ERROR: --apply-validation requires --cache "
+              "<findings_cache.json>")
+        sys.exit(2)
+    if not os.path.isfile(args.apply_validation):
+        print(f"ERROR: response file not found: {args.apply_validation}")
+        sys.exit(2)
+    if not os.path.isfile(args.cache):
+        print(f"ERROR: cache file not found: {args.cache}")
+        sys.exit(2)
+
+    try:
+        findings, files_analyzed = LLMResponseParser.load_findings_cache(
+            args.cache)
+        with open(args.apply_validation, 'r', encoding='utf-8') as fh:
+            response_text = fh.read()
+        confirmed = LLMResponseParser.parse(response_text, findings)
+    except Exception as e:
+        print(f"ERROR: failed to apply validation: {e}")
+        sys.exit(2)
+
+    out_path = args.output or str(
+        Path(args.cache).parent / "validated_action_report.html")
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+
+    LLMValidatedReportGenerator.generate(
+        confirmed, files_analyzed, out_path,
+        original_total=len(findings))
+
+    print(f"  Applied LLM validation:")
+    print(f"    Cache findings:   {len(findings)}")
+    print(f"    Confirmed (TP):   {len(confirmed)}")
+    print(f"    False positives:  {len(findings) - len(confirmed)}")
+    print(f"    Report written:   {out_path}")
+
+
 def main():
     """
     Entry point — launches GUI if no arguments given,
@@ -5742,6 +6676,15 @@ def main():
         python cpu_load_optimizer.py <target> [opts]   → CLI mode
         python cpu_load_optimizer.py --staged <repo>   → Staged changes CLI
     """
+    # Ensure console output can carry the Unicode used in log messages
+    # (e.g. the → arrow) on Windows code pages like cp1252, which would
+    # otherwise raise UnicodeEncodeError mid-analysis.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding='utf-8', errors='replace')
+        except (AttributeError, ValueError):
+            pass
+
     # If no arguments or --gui flag, launch GUI
     if len(sys.argv) == 1 or (len(sys.argv) == 2 and
                                sys.argv[1] == '--gui'):
@@ -5761,6 +6704,16 @@ Modes:
   Staged changes mode:
     python cpu_load_optimizer.py --staged /path/to/repo
     python cpu_load_optimizer.py --staged . -s critical --llm-export
+
+  CI gating (exit 1 on findings at/above threshold, exit 2 on crash):
+    python cpu_load_optimizer.py --staged . --fail-on critical
+
+  LLM validation round-trip (P0.3):
+    python cpu_load_optimizer.py src/ --llm-export
+    # → run automated_llm_prompt.md through the LLM, save its JSON reply
+    python cpu_load_optimizer.py --apply-validation reply.json \
+        --cache Output/llm_validation/findings_cache.json \
+        -o validated_action_report.html
 
   GUI mode:
     python cpu_load_optimizer.py
@@ -5794,8 +6747,26 @@ Rules Reference:
                              "export for Gemini/GPT review")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="Print findings to console")
+    parser.add_argument("--fail-on", default=None,
+                        choices=["critical", "high", "medium", "low"],
+                        help="Exit with code 1 if any finding is at or above "
+                             "this severity (for CI / pre-commit gating). "
+                             "Default: no gating (always exit 0).")
+    parser.add_argument("--apply-validation", metavar="RESPONSE_FILE",
+                        default=None,
+                        help="Apply an LLM validation JSON response to a "
+                             "findings cache and emit a validated HTML report")
+    parser.add_argument("--cache", metavar="FINDINGS_CACHE_JSON",
+                        default=None,
+                        help="findings_cache.json to correlate against when "
+                             "using --apply-validation")
 
     args = parser.parse_args()
+
+    # ── Apply-validation mode (LLM round-trip, P0.3) ─────────────────
+    if args.apply_validation:
+        _run_apply_validation(args)
+        return
 
     if args.gui:
         launch_gui()
@@ -5841,17 +6812,22 @@ Rules Reference:
             print(f"  Staged: {os.path.basename(fp)} "
                   f"({len(lines)} changed lines)")
 
-        run_analysis(
-            files=staged_files,
-            output_path=args.output,
-            min_severity=args.severity,
-            annotate=args.annotate,
-            llm_export=args.llm_export,
-            verbose=args.verbose,
-            staged_mode=True,
-            repo_path=repo_root,
-            staged_lines=staged_lines
-        )
+        try:
+            result = run_analysis(
+                files=staged_files,
+                output_path=args.output,
+                min_severity=args.severity,
+                annotate=args.annotate,
+                llm_export=args.llm_export,
+                verbose=args.verbose,
+                staged_mode=True,
+                repo_path=repo_root,
+                staged_lines=staged_lines
+            )
+        except Exception as e:
+            print(f"ERROR: analysis failed: {e}")
+            sys.exit(2)
+        _gate_and_exit(result, args.fail_on)
         return
 
     # ── File mode (default) ──────────────────────────────────
@@ -5864,14 +6840,19 @@ Rules Reference:
         print("No .c or .h files found.")
         sys.exit(1)
 
-    run_analysis(
-        files=files,
-        output_path=args.output,
-        min_severity=args.severity,
-        annotate=args.annotate,
-        llm_export=args.llm_export,
-        verbose=args.verbose,
-    )
+    try:
+        result = run_analysis(
+            files=files,
+            output_path=args.output,
+            min_severity=args.severity,
+            annotate=args.annotate,
+            llm_export=args.llm_export,
+            verbose=args.verbose,
+        )
+    except Exception as e:
+        print(f"ERROR: analysis failed: {e}")
+        sys.exit(2)
+    _gate_and_exit(result, args.fail_on)
 
 
 if __name__ == "__main__":

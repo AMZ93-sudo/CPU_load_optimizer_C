@@ -315,6 +315,47 @@ pip install Pillow
 python cpu_load_optimizer.py /path/to/source --output report.html --annotate
 ```
 
+### CI / pre-commit gating (`--fail-on`)
+
+`--fail-on {critical,high,medium,low}` makes the process exit **1** when any
+finding is at or above the given severity, and exit **2** on a tool crash
+(so pipelines can tell "found issues" from "the analyzer broke"). Without it
+the tool always exits 0 (backward compatible).
+
+```bash
+# Block a commit if any CRITICAL CPU-load issue is staged
+python cpu_load_optimizer.py --staged . --fail-on critical
+```
+
+`.git/hooks/pre-commit` (or a `pre-commit` hook entry):
+
+```bash
+#!/bin/sh
+python cpu_load_optimizer.py --staged . --fail-on critical || {
+    echo "CPU Load Optimizer found CRITICAL findings — commit blocked."
+    exit 1
+}
+```
+
+### LLM validation round-trip (`--apply-validation`)
+
+```bash
+# 1. Analyze and emit the LLM validation package (writes findings_cache.json)
+python cpu_load_optimizer.py src/ --llm-export
+
+# 2. Send Output/llm_validation/automated_llm_prompt.md to your LLM and save
+#    its fenced JSON reply (the {"verdicts":[…]} block) as reply.json
+
+# 3. Build the developer report from only the confirmed true positives
+python cpu_load_optimizer.py --apply-validation reply.json \
+    --cache Output/llm_validation/findings_cache.json \
+    -o validated_action_report.html
+```
+
+The JSON contract (`finding_index` joins back to the cache) is the canonical
+machine-readable format; the legacy `[C01] … VERDICT:` text format is still
+parsed as a fallback.
+
 **Requirements:**
 - Python 3.8+ (standard library only for core functionality)
 - Pillow (optional, for `--annotate` feature)
