@@ -101,7 +101,7 @@ class TestC05ExpensiveMathFunction:
     @pytest.mark.parametrize("func", [
         "sqrt", "sqrtf", "sin", "sinf", "cos", "cosf",
         "tan", "tanf", "pow", "powf", "log", "logf",
-        "exp", "expf", "fabs", "fabsf",
+        "exp", "expf", "asin", "acos",
     ])
     def test_fires_for_math_function(self, engine, func):
         # C05 has needs_context=True: it only fires when the call is
@@ -110,6 +110,14 @@ class TestC05ExpensiveMathFunction:
         # pattern and context check both trigger.
         src = f"for(int i=0;i<10;i++){{ float y = {func}(x); }}"
         assert "C05" in rule_ids(engine.analyze(src, "t.c")), f"C05 should fire for {func}()"
+
+    @pytest.mark.parametrize("func", ["fabs", "fabsf", "floorf", "ceilf"])
+    def test_fpu_cheap_functions_do_not_fire(self, engine, func):
+        # P1.6 — on an FPU core these map to single instructions (VABS.F32,
+        # VRINTM/VRINTP); flagging them is a false positive.
+        src = f"for(int i=0;i<10;i++){{ float y = {func}(x); }}"
+        assert "C05" not in rule_ids(engine.analyze(src, "t.c")), \
+            f"C05 must NOT fire for FPU-cheap {func}()"
 
     def test_no_fire_outside_loop(self, engine):
         # Without a loop, the context check prevents C05 from firing.
@@ -135,9 +143,16 @@ class TestH01LoopInvariantComputation:
         src = "for (int i = 0; i < 10; i++) {\n  n = strlen(s);\n}\n"
         assert "H01" in rule_ids(engine.analyze(src, "t.c"))
 
-    def test_sizeof_fires(self, engine):
-        src = "for (int i = 0; i < 10; i++) {\n  n = sizeof(buf);\n}\n"
+    @pytest.mark.parametrize("call", ["strchr(s, c)", "strstr(s, q)", "memchr(p, c, n)"])
+    def test_on_scanners_fire(self, engine, call):
+        src = f"for (int i = 0; i < 10; i++) {{\n  r = {call};\n}}\n"
         assert "H01" in rule_ids(engine.analyze(src, "t.c"))
+
+    def test_sizeof_no_fire(self, engine):
+        # P0.4 — sizeof is a compile-time constant (C11 §6.5.3.4), zero
+        # runtime cost. Flagging it is a false positive by design.
+        src = "for (int i = 0; i < 10; i++) {\n  n = sizeof(buf);\n}\n"
+        assert "H01" not in rule_ids(engine.analyze(src, "t.c"))
 
 
 class TestH02Recursion:
@@ -253,17 +268,16 @@ class TestH07StructPassByValue:
         assert "H07" not in rule_ids(engine.analyze(src, "t.c"))
 
 
-class TestH08RedundantComputation:
+class TestH08Removed:
+    """P1.4 — H08 was removed: its single-line back-reference regex was a
+    false positive ~80% of the time. It must never fire now."""
 
-    def test_repeated_expression_fires(self, engine):
-        # H08 pattern uses a back-reference, so both occurrences must be
-        # on the same source line.
+    def test_repeated_expression_no_longer_fires(self, engine):
         src = "int y = a+b, z = a+b;\n"
-        assert "H08" in rule_ids(engine.analyze(src, "t.c"))
-
-    def test_unique_expressions_no_fire(self, engine):
-        src = "int y = a+b;\nint z = c+d;\n"
         assert "H08" not in rule_ids(engine.analyze(src, "t.c"))
+
+    def test_h08_not_in_registry(self, engine):
+        assert "H08" not in {r.id for r in engine.rules}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -298,13 +312,22 @@ class TestM02NonStaticFunction:
 
 class TestM03GlobalExternVariable:
 
-    def test_extern_variable_fires(self, engine):
-        src = "extern uint32_t globalCounter;\n"
+    def test_extern_variable_used_in_loop_fires(self, engine):
+        # P1.5 — M03 now requires the global to actually be used in a loop.
+        src = ("extern uint32_t globalCounter;\n"
+               "for (int i = 0; i < 10; i++) { x += globalCounter; }\n")
         assert "M03" in rule_ids(engine.analyze(src, "t.c"))
 
-    def test_volatile_variable_fires(self, engine):
-        src = "volatile uint32_t hwRegister;\n"
+    def test_volatile_variable_used_in_loop_fires(self, engine):
+        src = ("volatile uint32_t hwRegister;\n"
+               "for (int i = 0; i < 10; i++) { x = hwRegister; }\n")
         assert "M03" in rule_ids(engine.analyze(src, "t.c"))
+
+    def test_extern_not_used_in_loop_no_fire(self, engine):
+        # The old rule lied: it fired on the declaration regardless of any
+        # loop usage. Now a global never touched in a loop must not fire.
+        src = "extern uint32_t globalCounter;\n"
+        assert "M03" not in rule_ids(engine.analyze(src, "t.c"))
 
 
 class TestM05DeeplyNestedLoops:
@@ -559,8 +582,8 @@ class TestFindingInvariants:
         assert "C01" in rule_ids(engine.analyze(src, "t.c"))
 
     def test_h_file_analyzed_same_as_c_file(self, engine):
-        src = "extern uint32_t gCounter;\n"
-        assert "M03" in rule_ids(engine.analyze(src, "header.h"))
+        src = "float gRate = 5;\n"
+        assert "C01" in rule_ids(engine.analyze(src, "header.h"))
 
     def test_no_cross_file_state_between_calls(self, engine):
         # Two separate calls must not share state

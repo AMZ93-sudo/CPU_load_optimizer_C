@@ -186,7 +186,8 @@ class TestRunAnalysisSeverity:
         assert any(f.severity == Severity.CRITICAL for f in result["findings"])
 
     def test_min_low_includes_everything(self, tmp_dir):
-        src = "float speed = 5;\nextern uint32_t g;\n"
+        # C01 (CRITICAL float-as-int) + H05 (HIGH oversized int) → ≥2 sevs.
+        src = "float speed = 5;\nint count = 7;\n"
         path = write_c(tmp_dir, "test.c", src)
         result = run_analysis([path], self._out(tmp_dir), min_severity="low")
         sevs = {f.severity for f in result["findings"]}
